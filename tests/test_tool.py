@@ -1,6 +1,6 @@
 # tests/test_tool.py
-# Tests for recommend_courses and generate_assessment tools
-# Uses mocks — no real API server needed
+# Tests for recommend_courses and generate_assessment tools.
+# Uses mocks — no real API server or Ollama needed.
 
 from unittest.mock import patch, MagicMock
 
@@ -14,12 +14,24 @@ def _mock_rag():
     return mock
 
 
+_SAMPLE_PROFILE = {
+    "user_id": "emp_001",
+    "name": "Abiola K.",
+    "job_role": "Data Analyst",
+    "department": "Engineering",
+    "skill_level": "Intermediate",
+    "known_skills": ["SQL", "Python"],
+    "enrolled_courses": ["data-101"],
+    "context": "avatar_chat",
+}
+
+
 # ── recommend_courses ─────────────────────────────────────────────────────────
 
 class TestRecommendCourses:
 
-    def _call(self, mock_post, payload, status=200):
-        """Helper: patch requests.post and call recommend_courses tool."""
+    def _call(self, mock_post, payload, status=200, profile=None):
+        """Helper: patch requests.post, inject profile, and call recommend_courses."""
         mock_response = MagicMock()
         mock_response.status_code = status
         mock_response.json.return_value = payload
@@ -28,35 +40,55 @@ class TestRecommendCourses:
             mock_response.raise_for_status.side_effect = Exception(f"HTTP {status}")
         mock_post.return_value = mock_response
 
-        with patch("brain.tools.rag", _mock_rag()):
+        injected = profile or _SAMPLE_PROFILE
+
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=injected):
             from brain.tools import recommend_courses
             return recommend_courses.invoke({
-                "current_role": "Data Analyst",
-                "desired_role": "ML Engineer",
-                "skills_to_develop": "Python, PyTorch",
-                "time_commitment": "5 hours/week",
+                "learning_goal": "transition to machine learning",
+                "preferred_difficulty": "Beginner",
+                "preferred_duration": "Short",
             })
 
     @patch("brain.tools.requests.post")
     def test_returns_courses_on_success(self, mock_post):
         result = self._call(mock_post, {
             "courses": [
-                {"title": "Deep Learning with PyTorch", "description": "Hands-on DL course."},
-                {"title": "MLOps Fundamentals", "description": "Deploy ML models."},
+                {"title": "ML Foundations", "description": "Intro to ML."},
+                {"title": "Deep Learning with PyTorch", "description": "Hands-on DL."},
             ]
         })
+        assert "ML Foundations" in result
         assert "Deep Learning with PyTorch" in result
-        assert "MLOps Fundamentals" in result
 
     @patch("brain.tools.requests.post")
-    def test_missing_parameters_returns_message(self, mock_post):
-        with patch("brain.tools.rag", _mock_rag()):
+    def test_profile_fields_sent_to_api(self, mock_post):
+        """Profile fields from LMS must appear in the API payload — not missing."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"courses": [{"title": "Test", "description": ""}]}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=_SAMPLE_PROFILE):
             from brain.tools import recommend_courses
-            result = recommend_courses.invoke({
-                "current_role": "Data Analyst",
-                # missing desired_role, skills_to_develop, time_commitment
-            })
-        assert "Missing required parameters" in result
+            recommend_courses.invoke({"learning_goal": "learn Python"})
+
+        call_payload = mock_post.call_args[1]["json"]
+        assert call_payload["user_id"] == "emp_001"
+        assert call_payload["job_role"] == "Data Analyst"
+        assert call_payload["known_skills"] == ["SQL", "Python"]
+        assert call_payload["learning_goal"] == "learn Python"
+
+    @patch("brain.tools.requests.post")
+    def test_missing_learning_goal_returns_message(self, mock_post):
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=_SAMPLE_PROFILE):
+            from brain.tools import recommend_courses
+            result = recommend_courses.invoke({})
+        assert "learning goal" in result.lower()
         mock_post.assert_not_called()
 
     @patch("brain.tools.requests.post")
@@ -67,15 +99,29 @@ class TestRecommendCourses:
     @patch("brain.tools.requests.post")
     def test_api_error_returns_friendly_message(self, mock_post):
         mock_post.side_effect = Exception("Connection refused")
-        with patch("brain.tools.rag", _mock_rag()):
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=_SAMPLE_PROFILE):
             from brain.tools import recommend_courses
-            result = recommend_courses.invoke({
-                "current_role": "Analyst",
-                "desired_role": "Engineer",
-                "skills_to_develop": "Python",
-                "time_commitment": "3 hours/week",
-            })
+            result = recommend_courses.invoke({"learning_goal": "learn ML"})
         assert "service error" in result.lower() or "couldn't fetch" in result.lower()
+
+    @patch("brain.tools.requests.post")
+    def test_no_profile_still_calls_api(self, mock_post):
+        """When no LMS profile is available the tool should still attempt the call."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"courses": [{"title": "Course A", "description": ""}]}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=None):
+            from brain.tools import recommend_courses
+            result = recommend_courses.invoke({"learning_goal": "learn SQL"})
+
+        assert "Course A" in result
+        call_payload = mock_post.call_args[1]["json"]
+        assert call_payload["user_id"] == ""          # graceful empty default
 
 
 # ── generate_assessment ───────────────────────────────────────────────────────

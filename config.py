@@ -28,5 +28,8 @@ RECOMMENDATION_API_URL = os.getenv(
 )
 ASSESSMENT_API_URL = os.getenv("ASSESSMENT_API_URL", "http://localhost:8002/generate")
 
+# LMS → Avatar shared secret  (set via env var in production)
+LMS_SHARED_SECRET = os.getenv("LMS_SHARED_SECRET", "dev-secret")
+
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()

@@ -3,6 +3,7 @@ import requests
 from langchain_core.tools import tool
 from config import RECOMMENDATION_API_URL, ASSESSMENT_API_URL
 from brain.rag import RAGManager
+from brain.session_context import get_profile
 from logger import logger, log_performance
 
 # Initialize RAG manager once
@@ -27,33 +28,53 @@ def retrieve_policy(query: str) -> str:
 @tool
 @log_performance
 def recommend_courses(
-    current_role: str = None,
-    desired_role: str = None,
-    skills_to_develop: str = None,
-    time_commitment: str = None,
+    learning_goal: str = None,
+    preferred_category: str = None,
+    preferred_difficulty: str = None,
+    preferred_duration: str = None,
 ) -> str:
     """
-    Recommend courses based on career goals. Call this when the user wants course
-    recommendations for career development. You must gather current_role, desired_role,
-    skills_to_develop, and time_commitment before calling. If any are missing, ask the user.
+    Recommend courses based on what the employee wants to learn or achieve.
+
+    Only call this tool once you know the employee's learning_goal.
+    The other three fields (preferred_category, preferred_difficulty,
+    preferred_duration) are optional — use them if the employee mentioned them.
+
+    Do NOT ask the employee for their job role, department, skills, or enrolled
+    courses — those come from their LMS profile automatically.
     """
     logger.info("Tool: recommend_courses called")
-    # Validate required parameters
-    required = {"current_role", "desired_role", "skills_to_develop", "time_commitment"}
-    provided = {k: v for k, v in locals().items() if k in required and v is not None}
-    missing = required - set(provided.keys())
-    if missing:
-        msg = f"Missing required parameters: {', '.join(missing)}. Please ask the user for these."
-        logger.warning(msg)
-        return msg
+
+    if not learning_goal:
+        return (
+            "I need to know your learning goal before I can recommend courses. "
+            "What would you like to learn or achieve?"
+        )
+
+    # Pull LMS profile fields injected at session start
+    profile = get_profile() or {}
 
     payload = {
-        "current_role": current_role,
-        "desired_role": desired_role,
-        "skills": skills_to_develop,
-        "time_commitment": time_commitment,
+        # ── From LMS profile (no need to ask the user) ──────────────────
+        "user_id": profile.get("user_id", ""),
+        "name": profile.get("name", ""),
+        "job_role": profile.get("job_role", ""),
+        "department": profile.get("department", ""),
+        "skill_level": profile.get("skill_level", "Beginner"),
+        "known_skills": profile.get("known_skills", []),
+        "enrolled_courses": profile.get("enrolled_courses", []),
+        "context": profile.get("context", "avatar_chat"),
+        # ── From the current conversation ───────────────────────────────
+        "learning_goal": learning_goal,
+        "preferred_category": preferred_category or "",
+        "preferred_difficulty": preferred_difficulty or profile.get("skill_level", "Beginner"),
+        "preferred_duration": preferred_duration or "",
     }
-    logger.info(f"Calling recommendation API with payload: {payload}")
+
+    logger.info(
+        f"Calling recommendation API | user: {payload['user_id']} "
+        f"| goal: {learning_goal}"
+    )
     try:
         response = requests.post(RECOMMENDATION_API_URL, json=payload, timeout=10)
         response.raise_for_status()
@@ -63,29 +84,26 @@ def recommend_courses(
             return "No courses found matching your criteria."
         result = "Here are some recommended courses:\n"
         for i, course in enumerate(courses, 1):
-            result += f"{i}. {course['title']}: {course['description']}\n"
+            result += f"{i}. {course['title']}: {course.get('description', '')}\n"
         logger.info(f"Recommendation API returned {len(courses)} courses")
         return result
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         logger.error(f"Recommendation API error: {e}")
-        return (
-            f"Sorry, I couldn't fetch recommendations due to a service error: {str(e)}"
-        )
+        return f"Sorry, I couldn't fetch recommendations due to a service error: {str(e)}"
 
 
 @tool
 @log_performance
 def generate_assessment(course_id: str = None) -> str:
     """
-    Generate a quiz or assessment for a completed course. Call this when the user
-    says they have finished a module or course and want to test their knowledge.
-    You need the course_id (or course name) – ask the user if not provided.
+    Generate a quiz or assessment for a completed course. Call this when the
+    employee says they have finished a module or course and want to test their
+    knowledge. You need the course_id — ask the employee if not provided.
     """
     logger.info("Tool: generate_assessment called")
+
     if not course_id:
-        msg = "Course ID is required. Please ask the user which course they completed."
-        logger.warning(msg)
-        return msg
+        return "Course ID is required. Which course did you complete?"
 
     payload = {"course_id": course_id}
     logger.info(f"Calling assessment API with payload: {payload}")
@@ -104,11 +122,9 @@ def generate_assessment(course_id: str = None) -> str:
                     result += f"   - {opt}\n"
         logger.info(f"Assessment API returned {len(questions)} questions")
         return result
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         logger.error(f"Assessment API error: {e}")
-        return (
-            f"Sorry, I couldn't generate an assessment due to a service error: {str(e)}"
-        )
+        return f"Sorry, I couldn't generate an assessment due to a service error: {str(e)}"
 
 
 # Export list of tools
