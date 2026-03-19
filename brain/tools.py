@@ -29,19 +29,43 @@ def retrieve_policy(query: str) -> str:
 @log_performance
 def recommend_courses(
     learning_goal: str = None,
-    preferred_category: str = None,
     preferred_difficulty: str = None,
     preferred_duration: str = None,
+    preferred_category: str = None,
 ) -> str:
     """
     Recommend courses based on what the employee wants to learn or achieve.
 
-    Only call this tool once you know the employee's learning_goal.
-    The other three fields (preferred_category, preferred_difficulty,
-    preferred_duration) are optional — use them if the employee mentioned them.
+    Rules for filling parameters:
 
-    Do NOT ask the employee for their job role, department, skills, or enrolled
-    courses — those come from their LMS profile automatically.
+    learning_goal (REQUIRED):
+      The employee's stated objective. Must be gathered from the conversation
+      before calling this tool. If not yet known, ask the employee.
+
+    preferred_difficulty (OPTIONAL — infer or use stated value):
+      What difficulty level the employee wants. Accept what the employee says
+      ("something beginner-friendly", "intermediate", "advanced"). If not
+      stated, leave as None and the system will fall back to their skill level
+      from the LMS profile.
+      Values: "Beginner", "Intermediate", "Advanced"
+
+    preferred_duration (OPTIONAL — INFER from the conversation, do not ask):
+      Map time mentions to one of three values:
+        "Short"  — under 3 hours/week ("weekends only", "an hour here and there",
+                   "5 hours a week", "not much time")
+        "Medium" — 3–10 hours/week ("a few hours daily", "about an hour a day",
+                   "10 hours a week")
+        "Long"   — 10+ hours/week ("full time", "I can dedicate a lot of time",
+                   "20 hours a week", "intensive")
+      If the employee made no time mention at all, leave as None.
+
+    preferred_category (OPTIONAL — extract if mentioned):
+      Topic area the employee expressed interest in
+      (e.g. "data science", "leadership", "cloud", "project management").
+      Leave as None if not mentioned.
+
+    Do NOT ask the employee for job role, department, skills, or enrolled
+    courses — those are loaded silently from their LMS profile.
     """
     logger.info("Tool: recommend_courses called")
 
@@ -55,7 +79,7 @@ def recommend_courses(
     profile = get_profile() or {}
 
     payload = {
-        # ── From LMS profile (no need to ask the user) ──────────────────
+        # ── From LMS profile (silent — never ask the employee) ───────────
         "user_id": profile.get("user_id", ""),
         "name": profile.get("name", ""),
         "job_role": profile.get("job_role", ""),
@@ -64,11 +88,11 @@ def recommend_courses(
         "known_skills": profile.get("known_skills", []),
         "enrolled_courses": profile.get("enrolled_courses", []),
         "context": profile.get("context", "avatar_chat"),
-        # ── From the current conversation ───────────────────────────────
+        # ── From the current conversation (extracted / inferred) ─────────
         "learning_goal": learning_goal,
-        "preferred_category": preferred_category or "",
         "preferred_difficulty": preferred_difficulty or profile.get("skill_level", "Beginner"),
-        "preferred_duration": preferred_duration or "",
+        "preferred_duration": preferred_duration or "Short",
+        "preferred_category": preferred_category or "",
     }
 
     logger.info(

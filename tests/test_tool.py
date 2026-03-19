@@ -64,7 +64,7 @@ class TestRecommendCourses:
 
     @patch("brain.tools.requests.post")
     def test_profile_fields_sent_to_api(self, mock_post):
-        """Profile fields from LMS must appear in the API payload — not missing."""
+        """LMS profile fields must appear in the API payload without being asked."""
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {"courses": [{"title": "Test", "description": ""}]}
@@ -81,6 +81,101 @@ class TestRecommendCourses:
         assert call_payload["job_role"] == "Data Analyst"
         assert call_payload["known_skills"] == ["SQL", "Python"]
         assert call_payload["learning_goal"] == "learn Python"
+
+    @patch("brain.tools.requests.post")
+    def test_explicit_difficulty_is_forwarded(self, mock_post):
+        """preferred_difficulty stated by the user must override the profile skill_level."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"courses": [{"title": "Adv ML", "description": ""}]}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=_SAMPLE_PROFILE):
+            from brain.tools import recommend_courses
+            recommend_courses.invoke({
+                "learning_goal": "deep learning research",
+                "preferred_difficulty": "Advanced",
+            })
+
+        call_payload = mock_post.call_args[1]["json"]
+        assert call_payload["preferred_difficulty"] == "Advanced"
+
+    @patch("brain.tools.requests.post")
+    def test_difficulty_falls_back_to_profile_skill_level(self, mock_post):
+        """When preferred_difficulty is omitted, skill_level from LMS profile is used."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"courses": [{"title": "ML 101", "description": ""}]}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=_SAMPLE_PROFILE):
+            from brain.tools import recommend_courses
+            recommend_courses.invoke({"learning_goal": "learn ML"})
+
+        call_payload = mock_post.call_args[1]["json"]
+        # _SAMPLE_PROFILE has skill_level = "Intermediate"
+        assert call_payload["preferred_difficulty"] == "Intermediate"
+
+    @patch("brain.tools.requests.post")
+    def test_inferred_duration_short(self, mock_post):
+        """Agent-inferred 'Short' duration is forwarded correctly."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"courses": [{"title": "Quick ML", "description": ""}]}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=_SAMPLE_PROFILE):
+            from brain.tools import recommend_courses
+            recommend_courses.invoke({
+                "learning_goal": "learn ML",
+                "preferred_duration": "Short",   # LLM inferred from "weekends only"
+            })
+
+        call_payload = mock_post.call_args[1]["json"]
+        assert call_payload["preferred_duration"] == "Short"
+
+    @patch("brain.tools.requests.post")
+    def test_no_duration_mention_defaults_to_short(self, mock_post):
+        """When no time was mentioned, preferred_duration defaults to 'Short'."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"courses": [{"title": "ML 101", "description": ""}]}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=_SAMPLE_PROFILE):
+            from brain.tools import recommend_courses
+            recommend_courses.invoke({"learning_goal": "learn ML"})  # no duration passed
+
+        call_payload = mock_post.call_args[1]["json"]
+        assert call_payload["preferred_duration"] == "Short"
+
+    @patch("brain.tools.requests.post")
+    def test_preferred_category_forwarded_when_provided(self, mock_post):
+        """Topic mention extracted from conversation is sent to the API."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"courses": [{"title": "Cloud 101", "description": ""}]}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        with patch("brain.tools.rag", _mock_rag()), \
+             patch("brain.tools.get_profile", return_value=_SAMPLE_PROFILE):
+            from brain.tools import recommend_courses
+            recommend_courses.invoke({
+                "learning_goal": "move into cloud engineering",
+                "preferred_category": "cloud",
+            })
+
+        call_payload = mock_post.call_args[1]["json"]
+        assert call_payload["preferred_category"] == "cloud"
 
     @patch("brain.tools.requests.post")
     def test_missing_learning_goal_returns_message(self, mock_post):
