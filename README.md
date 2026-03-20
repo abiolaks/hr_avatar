@@ -1,16 +1,37 @@
 # HR Avatar
 
-A real-time conversational AI HR assistant that listens to employee questions, generates intelligent responses using a RAG-powered LLM, synthesizes a voice reply, and renders a lip-synced avatar video — all running locally.
+A real-time conversational AI HR assistant that listens to employee questions, generates intelligent responses using a RAG-powered LLM, synthesizes a voice reply, and renders a lip-synced avatar video — designed to integrate seamlessly with a Learning Management System (LMS).
 
 ---
 
 ## Architecture
 
+### Standalone mode (microphone)
 ```
 Microphone → VAD → Whisper → LangGraph Agent → XTTS → Wav2Lip → Video
                                     ↕
                               ChromaDB (RAG)
                          HR Policy Documents (PDF/TXT)
+```
+
+### LMS-integrated mode (API)
+```
+LMS Backend ──POST /session/start──► Avatar API
+                { user profile }          │
+                                    Session Store
+                                    (profile + agent)
+                                          │
+LMS Frontend ──POST /chat──────────►  Agent.run()
+              { session_id,              ↕
+                message }          ChromaDB (RAG)
+                                          │
+                                    recommend_courses tool
+                                    merges profile + intent
+                                          │
+                                   Recommendation API
+                                   (full payload, no gaps)
+                                          │
+              ◄── reply + video_url ──────┘
 ```
 
 | Component | Technology |
@@ -21,6 +42,8 @@ Microphone → VAD → Whisper → LangGraph Agent → XTTS → Wav2Lip → Vide
 | RAG / Policy Search | ChromaDB + OllamaEmbeddings (nomic-embed-text) |
 | Text-to-Speech | Coqui XTTS v2 (voice cloning) |
 | Lip Sync | Wav2Lip GAN |
+| Web API | FastAPI + Uvicorn |
+| LMS Session Layer | In-memory session store + ContextVar profile injection |
 
 ---
 
@@ -28,8 +51,8 @@ Microphone → VAD → Whisper → LangGraph Agent → XTTS → Wav2Lip → Vide
 
 ```
 hr_avatar/
-├── main.py                        # Entry point — orchestrates full pipeline
-├── config.py                      # Paths, model names, API endpoints
+├── main.py                        # Entry point — standalone microphone pipeline
+├── config.py                      # Paths, model names, API endpoints, secrets
 ├── logger.py                      # Logging + performance decorator
 ├── conftest.py                    # pytest sys.path setup
 ├── requirements.txt               # Python dependencies
@@ -38,9 +61,11 @@ hr_avatar/
 ├── blockers_n_solutions.md        # Setup issues and fixes log
 │
 ├── brain/
-│   ├── agent.py                   # LangGraph ReAct agent
-│   ├── rag.py                     # ChromaDB RAG manager
-│   ├── tools.py                   # LangChain tools
+│   ├── agent.py                   # LangGraph ReAct agent (profile-aware)
+│   ├── rag.py                     # ChromaDB RAG manager (PDF + TXT)
+│   ├── tools.py                   # LangChain tools (policy, recommend, assess)
+│   ├── session.py                 # In-memory session store
+│   ├── session_context.py         # ContextVar — injects LMS profile into tools
 │   └── state.py                   # Agent state
 │
 ├── vad/vad.py                     # Microphone + speech segmentation
@@ -48,13 +73,187 @@ hr_avatar/
 ├── voice/voice.py                 # XTTS voice synthesis
 ├── face/face.py                   # Wav2Lip lip-sync runner
 │
+├── web/app.py                     # FastAPI server — LMS integration endpoints
+│
 ├── assets/                        # Avatar image, video, voice sample
 ├── hr_docs/                       # HR policy documents (PDF or TXT)
 └── tests/
-    ├── test_rag.py
-    ├── test_tool.py
-    └── test_brain.py
+    ├── test_rag.py                # RAG ingestion and retrieval
+    ├── test_tool.py               # Tool unit tests (mocked API calls)
+    ├── test_session.py            # Session store + API endpoint tests
+    └── test_brain.py              # Full agent conversation (requires Ollama)
 ```
+
+---
+
+## LMS Integration
+
+### How it works
+
+The Avatar is designed so the LMS owns the employee's profile data. The Avatar owns the conversation. Neither duplicates the other's responsibility.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│        LMS profile (silent — never ask the employee)    │
+├─────────────────────────────────────────────────────────┤
+│  user_id, name, job_role, department                    │
+│  skill_level, known_skills, enrolled_courses            │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│        Conversation intent (agent extracts/infers)      │
+├─────────────────────────────────────────────────────────┤
+│  learning_goal      — agent asks once if not stated     │
+│  preferred_difficulty — accept if stated; fall back     │
+│                         to skill_level from LMS profile │
+│  preferred_duration — INFERRED from time mentions,      │
+│                        never asked explicitly           │
+│  preferred_category — extracted from topic mentions     │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Duration inference mapping** (LLM infers without asking):
+
+| Employee says | Maps to |
+|---|---|
+| "weekends only", "5 hours a week", "not much time" | `Short` |
+| "an hour a day", "10 hours a week", "a few hours daily" | `Medium` |
+| "full time", "20 hours a week", "intensive" | `Long` |
+
+The `recommend_courses` tool merges both sources before calling the recommendation API, sending a complete payload every time.
+
+---
+
+### API Endpoints
+
+| Method | Path | Caller | Purpose |
+|---|---|---|---|
+| `POST` | `/session/start` | LMS backend | Start session, pass employee profile |
+| `POST` | `/chat` | LMS frontend | Text conversation turn |
+| `POST` | `/chat/audio` | LMS frontend | Audio upload — transcribed then processed |
+| `GET` | `/video/{id}` | LMS frontend | Stream the lip-sync video response |
+| `DELETE` | `/session/{id}` | LMS backend | End session on logout |
+| `GET` | `/health` | LMS / monitoring | Liveness check |
+
+---
+
+### Session start
+
+The LMS backend calls this once when an employee opens the Avatar widget. The employee profile is stored server-side — the frontend never needs to send it again.
+
+**Request**
+```http
+POST /session/start
+Authorization: Bearer <LMS_SHARED_SECRET>
+Content-Type: application/json
+
+{
+  "user_id": "emp_9821",
+  "name": "Abiola K.",
+  "job_role": "Data Analyst",
+  "department": "Engineering",
+  "skill_level": "Intermediate",
+  "known_skills": ["SQL", "Python"],
+  "enrolled_courses": ["data-101", "sql-advanced"],
+  "context": "dashboard"
+}
+```
+
+**Response**
+```json
+{
+  "session_id": "sess_abc123def456",
+  "message": "Session started for Abiola K."
+}
+```
+
+The `session_id` is stored by the LMS frontend and included in every subsequent `/chat` request.
+
+---
+
+### Chat turn (text)
+
+```http
+POST /chat
+Content-Type: application/json
+
+{
+  "session_id": "sess_abc123def456",
+  "message": "I want to move into machine learning, I only have weekends free"
+}
+```
+
+**Response**
+```json
+{
+  "session_id": "sess_abc123def456",
+  "reply": "Based on your Python background, here are some short weekend-friendly ML courses...",
+  "video_url": "/video/output_xyz.mp4"
+}
+```
+
+The recommendation API receives the full payload automatically:
+
+```json
+{
+  "user_id": "emp_9821",
+  "name": "Abiola K.",
+  "job_role": "Data Analyst",
+  "department": "Engineering",
+  "skill_level": "Intermediate",
+  "known_skills": ["SQL", "Python"],
+  "enrolled_courses": ["data-101", "sql-advanced"],
+  "context": "avatar_chat",
+  "learning_goal": "move into machine learning",
+  "preferred_difficulty": "Intermediate",
+  "preferred_duration": "Short",
+  "preferred_category": ""
+}
+```
+
+---
+
+### Chat turn (audio)
+
+```http
+POST /chat/audio?session_id=sess_abc123def456
+Content-Type: multipart/form-data
+
+audio: <WAV file from microphone>
+```
+
+The server transcribes the audio then processes it identically to `/chat`.
+
+---
+
+### Security
+
+The shared secret between the LMS and Avatar is set via environment variable:
+
+```bash
+export LMS_SHARED_SECRET="your-secret-here"
+```
+
+The LMS backend sends it as `Authorization: Bearer <secret>` on `/session/start`. All other endpoints require only a valid `session_id`.
+
+Sessions expire automatically after **60 minutes** of inactivity.
+
+---
+
+## Running the API server
+
+```bash
+source hr_venv/bin/activate
+ollama serve          # separate terminal
+
+# Start the Avatar API
+uvicorn web.app:app --host 0.0.0.0 --port 8000
+
+# Or directly
+python web/app.py
+```
+
+Interactive API docs available at `http://localhost:8000/docs`.
 
 ---
 
@@ -134,7 +333,12 @@ ollama pull nomic-embed-text
 ```bash
 # Place PDF/TXT policy files in hr_docs/
 ollama serve          # separate terminal
+
+# Standalone microphone mode
 python main.py
+
+# Or LMS API mode
+uvicorn web.app:app --host 0.0.0.0 --port 8000
 ```
 
 ---
@@ -237,6 +441,8 @@ docker build -t hr-avatar .
 docker run --gpus all \
     --device /dev/snd \
     -e OLLAMA_HOST=http://host.docker.internal:11434 \
+    -e LMS_SHARED_SECRET=your-secret-here \
+    -p 8000:8000 \
     -v $(pwd)/hr_docs:/app/hr_docs \
     -v $(pwd)/assets:/app/assets \
     -v $(pwd)/wav2lip_gan.pth:/app/wav2lip_gan.pth \
@@ -249,6 +455,8 @@ docker run --gpus all \
 docker run \
     --device /dev/snd \
     -e OLLAMA_HOST=http://host.docker.internal:11434 \
+    -e LMS_SHARED_SECRET=your-secret-here \
+    -p 8000:8000 \
     -v $(pwd)/hr_docs:/app/hr_docs \
     -v $(pwd)/assets:/app/assets \
     -v $(pwd)/wav2lip_gan.pth:/app/wav2lip_gan.pth \
@@ -300,8 +508,9 @@ RUN curl -L "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.2
     -o face/wav2lip/checkpoints/mobilenet.pth
 
 ENV OLLAMA_HOST=http://host.docker.internal:11434
+ENV LMS_SHARED_SECRET=change-me-in-production
 
-CMD ["python", "main.py"]
+CMD ["uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 ---
@@ -332,8 +541,11 @@ services:
       - ollama
     environment:
       - OLLAMA_HOST=http://ollama:11434
+      - LMS_SHARED_SECRET=change-me-in-production
+    ports:
+      - "8000:8000"
     devices:
-      - /dev/snd   # microphone access
+      - /dev/snd   # microphone access (standalone mode only)
     volumes:
       - ./hr_docs:/app/hr_docs
       - ./assets:/app/assets
@@ -364,24 +576,45 @@ volumes:
 pytest tests/ -v
 ```
 
-| Test file | What it tests |
-|---|---|
-| `test_rag.py` | RAG document ingestion and retrieval (requires Ollama) |
-| `test_tool.py` | `recommend_courses` and `generate_assessment` tools (mocked) |
-| `test_brain.py` | HRAgent full conversation (requires Ollama) |
+| Test file | What it tests | Requires |
+|---|---|---|
+| `test_rag.py` | RAG document ingestion and retrieval | Ollama running |
+| `test_tool.py` | `recommend_courses` and `generate_assessment` tools | Mocked — no server needed |
+| `test_session.py` | Session store, `/session/start`, `/chat` endpoints | Mocked — no server needed |
+| `test_brain.py` | HRAgent full conversation | Ollama running |
 
 ---
 
-## Example Questions
+## Environment Variables
 
-Based on the Aurora Analytics HR Policy Manual:
+| Variable | Default | Description |
+|---|---|---|
+| `LMS_SHARED_SECRET` | `dev-secret` | Secret the LMS backend uses to authenticate `/session/start` |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
+| `RECOMMENDATION_API_URL` | `http://localhost:8001/recommend` | LMS recommendation engine |
+| `ASSESSMENT_API_URL` | `http://localhost:8002/generate` | LMS assessment engine |
+| `LOG_LEVEL` | `INFO` | Logging level |
 
+> Set `LMS_SHARED_SECRET` to a strong random value in production. Never commit it.
+
+---
+
+## Example Conversations
+
+### HR Policy questions
 - *"What are the standard working hours?"*
 - *"How many days of annual leave do I get?"*
 - *"How long is paternity leave?"*
 - *"What is the code of conduct policy?"*
 - *"How much notice do I need to give to resign?"*
-- *"Does the company sponsor training and certifications?"*
+
+### Course recommendations (LMS integrated)
+- *"I want to move into machine learning"* — agent asks nothing; uses LMS profile + infers duration from context
+- *"I want to get into cloud engineering, I only have weekends"* — infers `Short` duration, sends `preferred_category: cloud`
+- *"Something advanced in data science, I can dedicate about 10 hours a week"* — infers `Medium`, difficulty `Advanced`
+
+### Assessments
+- *"I just finished the Python basics course"* — agent asks for course ID if needed, generates quiz
 
 ---
 
@@ -391,3 +624,4 @@ Based on the Aurora Analytics HR Policy Manual:
 - Wav2Lip adds ~10 seconds per response
 - Microphone access inside Docker requires `/dev/snd` device passthrough
 - `qwen3:4b` tool reliability improves with direct, specific questions
+- Session store is in-memory — sessions are lost on server restart (use Redis for production)

@@ -307,6 +307,133 @@ curl -L "https://huggingface.co/Nekochu/Wav2Lip/resolve/main/wav2lip_gan.pth?dow
 
 ---
 
+## 18. `recommend_courses` Tool — Asking for Data the LMS Already Has
+
+**Problem:**
+The `recommend_courses` tool was asking the employee for `current_role`, `desired_role`, `skills_to_develop`, and `time_commitment`. The LMS already holds the employee's profile (job role, department, skill level, enrolled courses, known skills). Asking the user to repeat this was redundant and poor UX.
+
+**Root Cause:**
+The tool was designed as a standalone function with no access to session context. It treated all parameters as things to gather from the conversation.
+
+**Fix:**
+Split payload fields into two categories:
+
+1. **LMS profile fields** — injected silently via `brain/session_context.py` using Python's `ContextVar`. The LMS passes these once at `/session/start`; tools read them without asking.
+2. **Conversation intent fields** — only what the agent actually extracts from what the employee says.
+
+```
+LMS profile (silent):     user_id, name, job_role, department,
+                          skill_level, known_skills, enrolled_courses
+
+Conversation intent:      learning_goal (ask once),
+                          preferred_difficulty (accept if stated),
+                          preferred_duration (infer — never ask),
+                          preferred_category (extract if mentioned)
+```
+
+Key files changed: `brain/session_context.py` (new), `brain/session.py` (new), `brain/tools.py`, `brain/agent.py`, `web/app.py`.
+
+---
+
+## 19. `preferred_duration` — Agent Was Not Inferring It
+
+**Problem:**
+`preferred_duration` (`Short`, `Medium`, `Long`) was being left blank unless the employee explicitly used those words. The recommendation API always received an empty string.
+
+**Root Cause:**
+The tool docstring didn't tell the LLM how to map natural language time mentions to the three valid values.
+
+**Fix:**
+Add an explicit inference mapping to the tool docstring so the LLM fills the parameter correctly before invoking the tool:
+
+```python
+"""
+preferred_duration (OPTIONAL — INFER from the conversation, do not ask):
+  Map time mentions to one of three values:
+    "Short"  — under 3 hours/week ("weekends only", "5 hours a week",
+               "not much time")
+    "Medium" — 3–10 hours/week ("a few hours daily", "about an hour a day",
+               "10 hours a week")
+    "Long"   — 10+ hours/week ("full time", "20 hours a week", "intensive")
+  If the employee made no time mention at all, leave as None.
+"""
+```
+
+The LLM reads tool docstrings as part of its tool schema. Inference rules in the docstring are enough — no additional Python logic is needed.
+
+Default when no time is mentioned: `"Short"` (safe fallback in the tool body).
+
+---
+
+## 20. `preferred_difficulty` — Not Falling Back to LMS Skill Level
+
+**Problem:**
+When the employee didn't state a difficulty preference, `preferred_difficulty` was sent as an empty string to the recommendation API instead of using the employee's known skill level.
+
+**Root Cause:**
+The tool was not reading the session profile to find a sensible default.
+
+**Fix:**
+Fall back to the `skill_level` field from the LMS profile when `preferred_difficulty` is not provided by the conversation:
+
+```python
+"preferred_difficulty": preferred_difficulty or profile.get("skill_level", "Beginner"),
+```
+
+This means:
+- Employee says "something advanced" → `"Advanced"` (explicit, wins)
+- Employee says nothing about difficulty → `"Intermediate"` (from LMS profile)
+- No profile available at all → `"Beginner"` (safe fallback)
+
+---
+
+## 21. `requests.exceptions.RequestException` Not Catching General Exceptions in Tests
+
+**Error:**
+```
+FAILED tests/test_tool.py::TestRecommendCourses::test_api_error_returns_friendly_message
+Exception: Connection refused
+```
+
+**Cause:**
+Tools caught only `requests.exceptions.RequestException`. The mock raised a plain `Exception`, which is not a subclass of `RequestException` and therefore propagated uncaught — crashing the test instead of returning a friendly error string.
+
+**Fix:**
+Broaden the catch clause to `Exception`. LangChain tools should never raise — they must always return a string so the agent can decide what to do:
+
+```python
+except Exception as e:
+    logger.error(f"Recommendation API error: {e}")
+    return f"Sorry, I couldn't fetch recommendations due to a service error: {str(e)}"
+```
+
+This also protects against `JSONDecodeError`, `TimeoutError`, and other non-request failures.
+
+---
+
+## 22. Pydantic v2 Deprecation — `.dict()` Replaced by `.model_dump()`
+
+**Warning:**
+```
+PydanticDeprecatedSince20: The `dict` method is deprecated; use `model_dump` instead.
+```
+
+**Cause:**
+`web/app.py` called `profile.dict()` on a Pydantic v2 model. The `.dict()` method still works but is deprecated and will be removed in v3.
+
+**Fix:**
+```python
+# Before
+session_id = create_session(profile.dict())
+session["agent"].set_profile(profile.dict())
+
+# After
+session_id = create_session(profile.model_dump())
+session["agent"].set_profile(profile.model_dump())
+```
+
+---
+
 ## Final Working Install Sequence
 
 ```bash
