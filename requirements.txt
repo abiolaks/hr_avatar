@@ -41,6 +41,8 @@ facenet-pytorch==2.6.0
 #   git clone https://github.com/justinjohn0306/Wav2Lip.git face/wav2lip
 gdown==5.1.0
 pypdf                      # needed to load PDF files into RAG
+docx2txt                   # needed to load .docx files into RAG
+azure-storage-blob         # Azure Blob Storage — company document store integration
 
 # Web (optional)
 fastapi==0.110.0

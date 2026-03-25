@@ -31,5 +31,11 @@ ASSESSMENT_API_URL = os.getenv("ASSESSMENT_API_URL", "http://localhost:8002/gene
 # LMS → Avatar shared secret  (set via env var in production)
 LMS_SHARED_SECRET = os.getenv("LMS_SHARED_SECRET", "dev-secret")
 
+# Azure Blob Storage — for ingesting company document store into RAG
+# Set these env vars to enable Azure document ingestion.
+# Leave blank to use local hr_docs/ only.
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+AZURE_STORAGE_CONTAINER        = os.getenv("AZURE_STORAGE_CONTAINER", "hr-documents")
+
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()

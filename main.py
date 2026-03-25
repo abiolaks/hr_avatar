@@ -85,9 +85,13 @@ class HRAvatar:
 
 if __name__ == "__main__":
     avatar = HRAvatar()
-    # To ingest HR documents first (uncomment after placing .txt files in ./hr_docs)
-    from brain.rag import RAGManager
 
+    from brain.rag import RAGManager
     rag = RAGManager()
-    rag.ingest_documents("./hr_docs")
+
+    # Ingest from local hr_docs/ AND Azure Blob Storage (if configured).
+    # Set AZURE_STORAGE_CONNECTION_STRING + AZURE_STORAGE_CONTAINER env vars
+    # to enable Azure. Local-only works without any env vars.
+    rag.ingest_all(local_path="./hr_docs")
+
     avatar.run_conversation()

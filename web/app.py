@@ -24,6 +24,7 @@ from typing import List, Optional
 import uvicorn
 
 from config import AVATAR_SILENT_VIDEO, ASSETS_DIR
+from brain.rag import RAGManager
 from brain.session import create_session, delete_session, get_session, active_session_count
 from transcriber.transcriber import Transcriber
 from voice.voice import VoiceSynthesizer
@@ -227,6 +228,55 @@ def end_session(session_id: str):
     """
     delete_session(session_id)
     return {"message": "Session ended."}
+
+
+# ── Document ingestion ─────────────────────────────────────────────────────────
+
+class IngestRequest(BaseModel):
+    local_path: Optional[str] = "./hr_docs"
+    azure_container: Optional[str] = None
+    azure_connection_string: Optional[str] = None
+
+
+@app.post("/admin/ingest")
+def trigger_ingest(
+    request: IngestRequest,
+    authorization: str = Header(...),
+):
+    """
+    Trigger RAG document ingestion from local folder and/or Azure Blob Storage.
+    Protected by the same shared secret as /session/start.
+
+    Body (all fields optional):
+      local_path             — local folder to scan (default: ./hr_docs)
+      azure_container        — Azure Blob Storage container name
+      azure_connection_string — overrides AZURE_STORAGE_CONNECTION_STRING env var
+
+    Example — ingest local only:
+      POST /admin/ingest  {}
+
+    Example — ingest Azure only:
+      POST /admin/ingest  {"local_path": null, "azure_container": "hr-documents"}
+
+    Example — ingest both:
+      POST /admin/ingest  {"local_path": "./hr_docs", "azure_container": "hr-documents"}
+    """
+    if not authorization.startswith("Bearer ") or authorization[7:] != _SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid or missing shared secret.")
+
+    rag = RAGManager()
+    try:
+        total = rag.ingest_all(
+            local_path=request.local_path,
+            azure_container=request.azure_container,
+            azure_connection_string=request.azure_connection_string,
+        )
+    except Exception as e:
+        logger.error(f"/admin/ingest failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    logger.info(f"/admin/ingest complete | chunks ingested: {total}")
+    return {"chunks_ingested": total, "status": "ok"}
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
