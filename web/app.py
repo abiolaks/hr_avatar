@@ -230,6 +230,63 @@ def end_session(session_id: str):
     return {"message": "Session ended."}
 
 
+class WelcomeRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/session/welcome", response_model=ChatResponse)
+def session_welcome(request: WelcomeRequest):
+    """
+    Called immediately after /session/start.
+    Generates a personalised spoken welcome greeting using the employee's
+    LMS profile — no LLM call, just TTS + Wav2Lip, so it's faster than /chat.
+    """
+    session = _require_session(request.session_id)
+    profile = session["profile"]
+
+    name   = profile.get("name", "there")
+    role   = profile.get("job_role", "")
+    dept   = profile.get("department", "")
+    skill  = profile.get("skill_level", "")
+    skills = ", ".join(profile.get("known_skills", []))
+
+    role_line = f"a {role}" if role else "an employee"
+    if dept:
+        role_line += f" in {dept}"
+
+    skill_line = ""
+    if skill:
+        skill_line = f" with {skill.lower()}-level skills"
+        if skills:
+            skill_line += f" in {skills}"
+
+    greeting = (
+        f"Welcome {name}! Great to see you. "
+        f"I can see you're {role_line}{skill_line}. "
+        f"I'm your HR Avatar — I'm here to help you with company policies, "
+        f"course recommendations, and knowledge assessments. "
+        f"What can I help you with today?"
+    )
+
+    video_id   = f"output_{uuid.uuid4().hex}.mp4"
+    video_path = f"/tmp/{video_id}"
+    temp_voice = f"/tmp/voice_{uuid.uuid4().hex}.wav"
+
+    try:
+        voice.synthesize(greeting, output_path=temp_voice)
+        lipsync.generate(AVATAR_SILENT_VIDEO, temp_voice, video_path)
+    finally:
+        if os.path.exists(temp_voice):
+            os.unlink(temp_voice)
+
+    logger.info(f"/session/welcome | session: {request.session_id} | user: {name}")
+    return ChatResponse(
+        session_id=request.session_id,
+        reply=greeting,
+        video_url=f"/video/{video_id}",
+    )
+
+
 # ── Document ingestion ─────────────────────────────────────────────────────────
 
 class IngestRequest(BaseModel):

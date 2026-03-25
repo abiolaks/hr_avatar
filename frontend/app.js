@@ -43,20 +43,45 @@ function escapeHtml(str) {
 }
 
 // ── Avatar states: idle | thinking | speaking ─────────────────────────────────
-const avatarStatus = document.getElementById('avatar-status');
+const avatarStatus  = document.getElementById('avatar-status');
+const playOverlay   = document.getElementById('play-overlay');
+const playBtn       = document.getElementById('play-btn');
 
 function setAvatar(state) {
   avatarContainer.className = `avatar-container ${state}`;
-  avatarStatus.textContent = state === 'thinking' ? 'Thinking…' : '';
+  avatarStatus.textContent  = state === 'thinking' ? 'Thinking…' : '';
+  if (state !== 'speaking') playOverlay.classList.add('hidden');
 }
 
 function playAvatarVideo(url) {
   setAvatar('speaking');
+  playOverlay.classList.add('hidden');
+
+  // Clear previous handlers before loading new src
+  avatarVideo.oncanplay = null;
+  avatarVideo.onerror   = null;
+  avatarVideo.onended   = null;
+
   avatarVideo.src = url;
-  avatarVideo.play().catch(() => {});
-  avatarVideo.onended = () => setAvatar('idle');
+  avatarVideo.load();
+
   avatarVideo.onerror = () => setAvatar('idle');
+  avatarVideo.onended = () => setAvatar('idle');
+
+  // Wait until enough data is buffered before playing
+  avatarVideo.oncanplay = () => {
+    avatarVideo.play().catch(() => {
+      // Browser blocked autoplay (unmuted video policy) — show click overlay
+      playOverlay.classList.remove('hidden');
+    });
+  };
 }
+
+// Click-to-play when autoplay is blocked
+playBtn.addEventListener('click', () => {
+  playOverlay.classList.add('hidden');
+  avatarVideo.play().catch(() => {});
+});
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 function addMessage(role, html) {
@@ -145,14 +170,8 @@ loginForm.addEventListener('submit', async (e) => {
     loginScreen.classList.remove('active');
     chatScreen.classList.add('active');
 
-    // Greeting (no API call needed — frontend-generated)
-    addMessage('assistant',
-      `Hello <strong>${escapeHtml(p.name)}</strong>! I'm your HR Avatar. ` +
-      `I can see you're a <strong>${escapeHtml(p.job_role)}</strong> in ` +
-      `<strong>${escapeHtml(p.department)}</strong> with ` +
-      `<strong>${p.skill_level.toLowerCase()}</strong>-level skills. ` +
-      `How can I help you today?`
-    );
+    // Trigger personalised spoken welcome — calls backend TTS+lipsync, no LLM
+    fetchWelcome(sessionId);
 
   } catch (err) {
     spin.classList.add('hidden');
@@ -165,6 +184,38 @@ loginForm.addEventListener('submit', async (e) => {
     );
   }
 });
+
+// ── Welcome greeting (called once after login) ────────────────────────────────
+async function fetchWelcome(sid) {
+  setProcessing(true);
+  showThinking();
+
+  try {
+    const res = await fetch(`${API}/session/welcome`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ session_id: sid }),
+    });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    removeThinking();
+    addMessage('assistant', escapeHtml(data.reply));
+
+    if (data.video_url) {
+      playAvatarVideo(`${API}${data.video_url}`);
+    } else {
+      setAvatar('idle');
+    }
+  } catch (err) {
+    // Welcome failure is non-fatal — just show idle avatar, user can still chat
+    removeThinking();
+    setAvatar('idle');
+  } finally {
+    setProcessing(false);
+  }
+}
 
 // ── Text Chat ─────────────────────────────────────────────────────────────────
 sendBtn.addEventListener('click', submitText);

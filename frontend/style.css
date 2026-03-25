@@ -348,6 +348,33 @@ html, body {
   letter-spacing: .3px;
 }
 
+/* Click-to-play fallback when browser blocks autoplay */
+.play-overlay {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: rgba(0,0,0,.52);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+.play-overlay.hidden { display: none; }
+.play-overlay #play-btn {
+  background: rgba(255,255,255,.92);
+  border: none;
+  border-radius: 999px;
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--navy);
+  cursor: pointer;
+  font-family: var(--font);
+  box-shadow: var(--shadow);
+  transition: background .15s;
+}
+.play-overlay #play-btn:hover { background: var(--white); }
+
 /* Employee card */
 .employee-card {
   width: 100%;
