@@ -434,33 +434,253 @@ session["agent"].set_profile(profile.model_dump())
 
 ---
 
+## 23. `/chat/audio` — HTTP 422 Unprocessable Entity
+
+**Error:**
+```
+Audio error: HTTP 422
+```
+
+**Cause:**
+`session_id` in `web/app.py` was declared as a plain `str` parameter alongside an `UploadFile`. FastAPI interprets plain `str` parameters as query parameters. The frontend sent `session_id` as a multipart form field, so FastAPI could not find it → 422.
+
+**Fix:**
+Declare `session_id` explicitly as a form field using `Form(...)`:
+
+```python
+from fastapi import Form
+
+async def chat_audio(
+    session_id: str = Form(...),    # ← was: session_id: str
+    audio: UploadFile = File(...),
+):
+```
+
+Also updated the frontend to send `session_id` as a form field (not a query param) and save the audio as `.webm` matching the browser's `MediaRecorder` output format.
+
+---
+
+## 24. Recommendation API — `Connection refused` (service not running)
+
+**Symptom:**
+Avatar responded: *"I'm sorry, there's a temporary issue with our learning service."*
+
+**Cause:**
+The `recommend_courses` tool calls `http://localhost:8001/recommend`. That service was never started — it's an external API to be built by the software engineering team. `requests.post()` got `Connection refused`, the tool caught it and returned a service error string, which the LLM rephrased politely.
+
+**Fix:**
+Created `mock_services.py` — a FastAPI stub that runs on port 8001 and serves realistic course recommendations and assessments for demo and development use:
+
+```bash
+python mock_services.py   # starts mock APIs on port 8001
+```
+
+When the real LMS APIs are ready, point to them via environment variables:
+
+```bash
+export RECOMMENDATION_API_URL=https://your-lms.com/api/recommend
+export ASSESSMENT_API_URL=https://your-lms.com/api/generate
+```
+
+---
+
+## 25. XTTS and Whisper Hardcoded to CPU — GPU Laptop Gets No Speedup
+
+**Problem:**
+`voice/voice.py` had `self.device = "cpu"` hardcoded. `transcriber/transcriber.py` had `device="cpu"` hardcoded. Cloning the repo to an NVIDIA GPU laptop gave no GPU speedup.
+
+**Cause:**
+The CPU was originally forced to work around `aten::_fft_r2c` not being implemented on Apple MPS (issue #13). But this also blocked NVIDIA CUDA, which fully supports the op.
+
+**Fix:**
+Both files now auto-detect the best available device at startup:
+
+`voice/voice.py`:
+```python
+if torch.cuda.is_available():
+    self.device = "cuda"
+else:
+    self.device = "cpu"   # covers macOS MPS and CPU-only machines
+```
+
+`transcriber/transcriber.py`:
+```python
+if torch.cuda.is_available():
+    device, compute_type = "cuda", "float16"
+else:
+    device, compute_type = "cpu", "int8"
+```
+
+Wav2Lip (subprocess) and Ollama already auto-detect CUDA — no changes needed there. The same codebase now runs optimally on both macOS (CPU) and NVIDIA GPU laptops without any manual changes.
+
+**Expected speedup on NVIDIA GPU:**
+
+| Stage | CPU | NVIDIA GPU |
+|---|---|---|
+| Ollama LLM | ~30–40s | ~3–6s |
+| XTTS v2 | ~60–90s | ~4–8s |
+| Wav2Lip | ~30–60s | ~2–5s |
+| **Total** | **2–4 min** | **~10–20s** |
+
+---
+
+## 26. Text Reply and Lip-Sync Video Not Appearing at the Same Time
+
+**Problem:**
+After trying an async approach (return text immediately, generate video in background), the avatar kept showing a "thinking" ring for 2+ minutes after the text appeared. This was poor UX — the CEO demo needed text and video to arrive together.
+
+**Root Cause:**
+The async background task (FastAPI `BackgroundTasks`) returned the text reply immediately but the video wasn't ready for 2+ minutes. The frontend polled for it, but the long wait felt broken.
+
+**Fix:**
+Reverted to a **synchronous pipeline**. The API blocks until all three stages complete (LLM → XTTS → Wav2Lip) and returns text + video URL in a single response. Both appear in the browser at the same instant.
+
+```python
+def _run_avatar_pipeline(agent, text: str) -> tuple[str, str]:
+    reply      = agent.run(text)          # LLM
+    voice.synthesize(reply, temp_voice)   # XTTS
+    lipsync.generate(..., temp_voice, video_path)  # Wav2Lip
+    return reply, video_path
+```
+
+The tradeoff is a longer wait before anything appears (~2–4 min on CPU, ~10–20s on GPU), but the UX is cleaner — nothing appears until it's all ready, eliminating the confusing gap between text and video.
+
+---
+
+## 27. Frontend Demo — Avatar Idle State and CORS
+
+**Changes made for the CEO demo frontend (`frontend/`):**
+
+1. **CORS not configured** — `web/app.py` had no CORS headers. Browser blocked all requests from `localhost:3000` to `localhost:8000`.
+   - Fix: Added `CORSMiddleware` with `allow_origins=["*"]` to `app.py`.
+
+2. **Avatar image not served** — The frontend couldn't load `assets/hr_avatar.jpg`.
+   - Fix: Added `StaticFiles` mount at `/assets` in `app.py`.
+
+3. **Idle avatar had CSS spinner rings** — User requested the idle state show the actual avatar face video instead of animated rings.
+   - Fix: Replaced rings with a looping `<video>` element playing `hr_avatar_silent.mp4`. This gives natural facial movement while the user is typing or waiting.
+
+4. **Avatar states**:
+   - `idle` → silent face video loops (natural movement)
+   - `thinking` → same video + "Thinking…" label + blue border
+   - `speaking` → lip-sync video plays + green border → returns to `idle` on end
+
+---
+
 ## Final Working Install Sequence
+
+### macOS (Apple Silicon — CPU)
 
 ```bash
 # 1. System deps
 brew install pkg-config ffmpeg
 
-# 2. Python deps
+# 2. Python environment
+python3.10 -m venv hr_venv
+source hr_venv/bin/activate
+
+# 3. Python deps
 pip install -r requirements.txt
 
-# 3. TTS (bypass numpy pin)
+# 4. TTS (bypass numpy pin)
 pip install TTS==0.22.0 --no-deps
 pip install coqpit trainer "transformers==4.44.2" einops encodec unidecode \
     inflect num2words pysbd anyascii spacy batch-face pypdf \
     "pandas>=1.4,<2.0" bangla bnnumerizer bnunicodenormalizer \
     hangul_romanize jamo jieba nltk pypinyin "gruut[de,es,fr]==2.2.3" \
-    umap-learn cython flask g2pkk "ollama>=0.3.0" "langchain-ollama==0.1.3"
+    umap-learn cython flask g2pkk "ollama>=0.3.0" "langchain-ollama==0.1.3" \
+    setuptools
 
-# 4. Clone Wav2Lip
+# 5. Clone Wav2Lip
 git clone https://github.com/justinjohn0306/Wav2Lip.git face/wav2lip
 
-# 5. Download model checkpoints
+# 6. Download model checkpoints
 curl -L "https://huggingface.co/Nekochu/Wav2Lip/resolve/main/wav2lip_gan.pth?download=true" \
     -o wav2lip_gan.pth
 curl -L "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth" \
     -o face/wav2lip/checkpoints/mobilenet.pth
 
-# 6. Pull Ollama models
+# 7. Pull Ollama models
 ollama pull qwen3:4b
 ollama pull nomic-embed-text
+```
+
+---
+
+### Ubuntu / Windows — NVIDIA GPU (Recommended for production and demos)
+
+```bash
+# 1. System deps (Ubuntu)
+sudo apt update && sudo apt install -y python3.10 python3.10-venv \
+    ffmpeg pkg-config portaudio19-dev git curl build-essential libsndfile1
+
+# Install CUDA 12.1+ from https://developer.nvidia.com/cuda-downloads
+# Verify GPU is visible:
+nvidia-smi
+
+# 2. Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# 3. Clone repo and create environment
+git clone https://github.com/abiolaks/hr_avatar.git
+cd hr_avatar
+python3.10 -m venv hr_venv
+source hr_venv/bin/activate
+
+# 4. Install PyTorch with CUDA FIRST (before requirements.txt)
+#    This ensures the CUDA-enabled build is used, not the CPU-only default.
+pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# 5. Verify GPU is available to PyTorch
+python -c "import torch; print('CUDA:', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# Expected: CUDA: True  <your GPU name>
+
+# 6. Install remaining Python deps
+pip install -r requirements.txt
+
+# 7. TTS (bypass numpy pin)
+pip install TTS==0.22.0 --no-deps
+pip install coqpit trainer "transformers==4.44.2" einops encodec unidecode \
+    inflect num2words pysbd anyascii spacy batch-face pypdf \
+    "pandas>=1.4,<2.0" bangla bnnumerizer bnunicodenormalizer \
+    hangul_romanize jamo jieba nltk pypinyin "gruut[de,es,fr]==2.2.3" \
+    umap-learn cython flask g2pkk "ollama>=0.3.0" "langchain-ollama==0.1.3" \
+    setuptools
+
+# 8. Clone Wav2Lip
+git clone https://github.com/justinjohn0306/Wav2Lip.git face/wav2lip
+
+# 9. Download model checkpoints
+curl -L "https://huggingface.co/Nekochu/Wav2Lip/resolve/main/wav2lip_gan.pth?download=true" \
+    -o wav2lip_gan.pth
+curl -L "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth" \
+    -o face/wav2lip/checkpoints/mobilenet.pth
+
+# 10. Pull Ollama models (Ollama auto-uses GPU)
+ollama pull qwen3:4b
+ollama pull nomic-embed-text
+
+# No code changes needed — XTTS, Whisper, Wav2Lip, and Ollama all auto-detect CUDA.
+```
+
+---
+
+### Running after setup (both platforms)
+
+```bash
+# Terminal 1 — LLM
+ollama serve
+
+# Terminal 2 — Avatar API (auto-detects GPU if available)
+source hr_venv/bin/activate
+uvicorn web.app:app --host 0.0.0.0 --port 8000
+
+# Terminal 3 — Mock LMS services (dev/demo only)
+source hr_venv/bin/activate
+python mock_services.py
+
+# Terminal 4 — Frontend demo
+cd frontend && python -m http.server 3000
+# Open http://localhost:3000
 ```

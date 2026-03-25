@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aurora Analytics — HR Avatar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── SCREEN 1: Login ─────────────────────────────────────────────── -->
+  <div id="login-screen" class="screen active">
+    <div class="login-bg">
+      <div class="bg-blob b1"></div>
+      <div class="bg-blob b2"></div>
+    </div>
+    <div class="login-card">
+      <div class="login-logo">
+        <div class="logo-icon">A</div>
+        <span>Aurora Analytics</span>
+      </div>
+      <h1>Meet Your HR Avatar</h1>
+      <p class="login-subtitle">AI-powered HR assistance, personalised for you</p>
+
+      <form id="login-form">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Full Name</label>
+            <input type="text" id="inp-name" value="Abiola K." required />
+          </div>
+          <div class="form-group">
+            <label>Employee ID</label>
+            <input type="text" id="inp-userid" value="emp_001" />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Job Role</label>
+            <input type="text" id="inp-role" value="Data Analyst" />
+          </div>
+          <div class="form-group">
+            <label>Department</label>
+            <input type="text" id="inp-dept" value="Engineering" />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Skill Level</label>
+            <select id="inp-skill">
+              <option>Beginner</option>
+              <option selected>Intermediate</option>
+              <option>Advanced</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Known Skills</label>
+            <input type="text" id="inp-skills" value="SQL, Python" placeholder="comma separated" />
+          </div>
+        </div>
+
+        <button type="submit" class="btn-primary btn-full" id="start-btn">
+          <span id="start-btn-label">Start Conversation</span>
+          <div class="btn-spinner hidden" id="btn-spinner"></div>
+        </button>
+      </form>
+
+      <p class="login-note">Demo environment · Aurora Analytics HR System v1.0</p>
+    </div>
+  </div>
+
+  <!-- ── SCREEN 2: Chat ──────────────────────────────────────────────── -->
+  <div id="chat-screen" class="screen">
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-icon sm">A</div>
+        <div>
+          <div class="header-title">Aurora Analytics · HR Avatar</div>
+          <div class="header-sub" id="header-sub">AI-powered HR Assistant</div>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="status-badge">
+          <span class="status-dot"></span>
+          <span>Live</span>
+        </div>
+        <button class="btn-end" id="end-btn">End Session</button>
+      </div>
+    </header>
+
+    <main class="chat-layout">
+
+      <!-- Left: Avatar Panel -->
+      <aside class="avatar-panel">
+        <div class="avatar-wrap">
+          <div class="avatar-container idle" id="avatar-container">
+            <!-- Idle / Thinking: silent looping video gives natural facial movement -->
+            <video
+              id="avatar-idle"
+              src="http://localhost:8000/assets/hr_avatar_silent.mp4"
+              autoplay loop muted playsinline
+            ></video>
+            <!-- Speaking: generated lip-sync video (shown only when response arrives) -->
+            <video id="avatar-video" playsinline></video>
+          </div>
+          <div class="avatar-status" id="avatar-status"></div>
+        </div>
+
+        <div class="employee-card">
+          <div class="emp-name" id="emp-name">—</div>
+          <div class="emp-role" id="emp-role">—</div>
+          <div class="emp-tags" id="emp-tags"></div>
+        </div>
+
+        <div class="capabilities">
+          <div class="cap-title">What I can help with</div>
+          <div class="cap-item">
+            <span class="cap-icon">📋</span>
+            <span>HR Policies &amp; Benefits</span>
+          </div>
+          <div class="cap-item">
+            <span class="cap-icon">🎓</span>
+            <span>Course Recommendations</span>
+          </div>
+          <div class="cap-item">
+            <span class="cap-icon">📝</span>
+            <span>Knowledge Assessments</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Right: Chat Panel -->
+      <section class="chat-panel">
+        <div class="messages" id="messages">
+          <div class="welcome-msg">
+            <div class="welcome-icon">👋</div>
+            <div class="welcome-text">
+              <strong>Hello!</strong> I'm your HR Avatar. Ask me about company policies,
+              course recommendations, or take a knowledge assessment after finishing a course.
+            </div>
+          </div>
+        </div>
+
+        <!-- Quick Questions -->
+        <div class="quick-questions">
+          <span class="quick-label">Try asking:</span>
+          <button class="quick-btn" data-q="What is the annual leave policy?">📋 Leave Policy</button>
+          <button class="quick-btn" data-q="Can you recommend courses to improve my data and ML skills?">🎓 Course Recs</button>
+          <button class="quick-btn" data-q="I just completed Python Basics. Can I take an assessment?">📝 Assessment</button>
+        </div>
+
+        <!-- Input Area -->
+        <div class="input-area">
+          <div class="input-wrapper">
+            <textarea
+              id="msg-input"
+              placeholder="Ask me anything about HR policies, courses, or assessments..."
+              rows="1"
+            ></textarea>
+            <div class="input-actions">
+              <button class="btn-mic" id="mic-btn" title="Voice message">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                  <line x1="12" y1="19" x2="12" y2="23"/>
+                  <line x1="8" y1="23" x2="16" y2="23"/>
+                </svg>
+              </button>
+              <button class="btn-send" id="send-btn" title="Send">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="22" y1="2" x2="11" y2="13"/>
+                  <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="recording-bar hidden" id="recording-bar">
+            <span class="rec-dot"></span>
+            <span>Recording… click the mic again to stop</span>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

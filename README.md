@@ -74,6 +74,12 @@ hr_avatar/
 ├── face/face.py                   # Wav2Lip lip-sync runner
 │
 ├── web/app.py                     # FastAPI server — LMS integration endpoints
+├── mock_services.py               # Mock recommendation + assessment APIs (demo/dev)
+│
+├── frontend/                      # CEO demo web UI (HTML/CSS/JS)
+│   ├── index.html                 # Single-page app
+│   ├── style.css                  # Professional styling
+│   └── app.js                     # Session, chat, audio, video logic
 │
 ├── assets/                        # Avatar image, video, voice sample
 ├── hr_docs/                       # HR policy documents (PDF or TXT)
@@ -215,11 +221,14 @@ The recommendation API receives the full payload automatically:
 
 ### Chat turn (audio)
 
+`session_id` must be sent as a **form field** alongside the audio file, not as a query parameter.
+
 ```http
-POST /chat/audio?session_id=sess_abc123def456
+POST /chat/audio
 Content-Type: multipart/form-data
 
-audio: <WAV file from microphone>
+session_id: sess_abc123def456
+audio: <audio file from microphone (WAV or WebM)>
 ```
 
 The server transcribes the audio then processes it identically to `/chat`.
@@ -257,13 +266,68 @@ Interactive API docs available at `http://localhost:8000/docs`.
 
 ---
 
+## Running the Frontend Demo
+
+A browser-based demo UI is included in `frontend/`. It provides a full chat interface with avatar video playback — designed for stakeholder demos.
+
+### Start all services
+
+Open four terminals:
+
+**Terminal 1 — Ollama (LLM)**
+```bash
+ollama serve
+```
+
+**Terminal 2 — Avatar API**
+```bash
+source hr_venv/bin/activate
+uvicorn web.app:app --host 0.0.0.0 --port 8000
+```
+
+**Terminal 3 — Mock LMS services** (recommendation + assessment APIs)
+```bash
+source hr_venv/bin/activate
+python mock_services.py
+```
+
+**Terminal 4 — Frontend**
+```bash
+cd frontend
+python -m http.server 3000
+```
+
+Then open **http://localhost:3000** in your browser.
+
+### What the demo shows
+
+| Feature | How to trigger |
+|---|---|
+| HR policy question | Type or ask "What is the annual leave policy?" |
+| Course recommendation | Click "Course Recs" quick button or ask naturally |
+| Knowledge assessment | Click "Assessment" quick button |
+| Voice input | Click the mic button, speak, click again to stop |
+
+The avatar loops the silent face video while idle, shows "Thinking…" while processing, and plays the lip-synced response video when ready.
+
+### Mock services
+
+`mock_services.py` runs a fake recommendation API on port 8001 for demo use. The real recommendation and assessment APIs are to be built by the software engineering team. To point at the real APIs when they are ready:
+
+```bash
+export RECOMMENDATION_API_URL=https://your-lms.com/api/recommend
+export ASSESSMENT_API_URL=https://your-lms.com/api/generate
+```
+
+---
+
 ## Platform Support
 
-| Platform | GPU | Tested |
+| Platform | GPU | Notes |
 |---|---|---|
-| macOS Apple Silicon (M1/M2/M3) | MPS (CPU fallback for XTTS) | Yes |
-| Ubuntu 20.04+ | NVIDIA CUDA | Yes (via Docker) |
-| Ubuntu 20.04+ | CPU only | Yes (slow) |
+| macOS Apple Silicon (M1/M2/M3) | CPU (MPS fallback) | XTTS and Whisper auto-select CPU — MPS unsupported for FFT ops |
+| Ubuntu / Windows — NVIDIA GPU | CUDA (auto-detected) | No code changes needed — all components auto-detect CUDA |
+| Ubuntu / Windows — CPU only | CPU | Works but slow (~2–4 min per response) |
 
 ---
 
@@ -394,18 +458,9 @@ pip install coqpit trainer "transformers==4.44.2" einops encodec unidecode \
     setuptools
 ```
 
-### 6. Enable GPU in config
+### 6. Download checkpoints and run
 
-Update `voice/voice.py` — NVIDIA CUDA supports all XTTS operations:
-
-```python
-# Change this line in voice/voice.py
-self.device = "cuda" if torch.cuda.is_available() else "cpu"
-```
-
-### 7. Download checkpoints and run
-
-Same as macOS steps 4–7 above.
+Same as macOS steps 4–7 above. No code changes needed — XTTS and Whisper auto-detect CUDA.
 
 ---
 
@@ -620,8 +675,10 @@ pytest tests/ -v
 
 ## Known Limitations
 
-- XTTS on CPU takes ~30 seconds per response (use GPU for faster synthesis)
-- Wav2Lip adds ~10 seconds per response
-- Microphone access inside Docker requires `/dev/snd` device passthrough
-- `qwen3:4b` tool reliability improves with direct, specific questions
-- Session store is in-memory — sessions are lost on server restart (use Redis for production)
+- **CPU response time**: ~2–4 minutes end-to-end (LLM ~30s + XTTS ~90s + Wav2Lip ~60s). Use an NVIDIA GPU for ~10–20s responses.
+- **GPU requirement**: Apple MPS is unsupported for XTTS (FFT ops) and Wav2Lip. NVIDIA CUDA only for GPU acceleration.
+- **Session store**: In-memory — sessions lost on server restart. Use Redis for production.
+- **Video storage**: Lip-sync videos stored in `/tmp` — lost on restart. Use S3 or a persistent volume for production.
+- **Recommendation/Assessment APIs**: `mock_services.py` is used in dev. The real LMS services must be built and pointed to via environment variables.
+- **Microphone in Docker**: Requires `/dev/snd` device passthrough.
+- **LLM tool reliability**: `qwen3:4b` performs best with clear, direct questions.

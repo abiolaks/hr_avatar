@@ -8,8 +8,12 @@ from logger import logger, log_performance
 
 class VoiceSynthesizer:
     def __init__(self, speaker_wav_path=VOICE_SAMPLE, model_name="tts_models/multilingual/multi-dataset/xtts_v2"):
-        # MPS does not support aten::_fft_r2c needed by XTTS — use CPU
-        self.device = "cpu"
+        # MPS (Apple Silicon) does not support aten::_fft_r2c needed by XTTS — force CPU on Mac.
+        # CUDA (NVIDIA) is fully supported and dramatically faster.
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"   # covers macOS MPS and CPU-only machines
         logger.info(f"Loading XTTS on {self.device}...")
         self.tts = TTS(model_name).to(self.device)
         self.speaker_wav = speaker_wav_path

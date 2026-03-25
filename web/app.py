@@ -15,8 +15,10 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import uvicorn
@@ -38,6 +40,15 @@ app = FastAPI(
     description="LMS-integrated conversational HR assistant",
     version="1.0.0",
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
 # Shared secret the LMS must send to create sessions.
 # Set via env var LMS_SHARED_SECRET; defaults to "dev-secret" for local dev.
@@ -88,19 +99,21 @@ def _require_session(session_id: str):
 
 def _run_avatar_pipeline(agent, text: str) -> tuple[str, str]:
     """
-    Run agent → voice → lipsync.
+    Synchronous pipeline: LLM → TTS (edge-tts, ~1-2s) → Wav2Lip.
     Returns (reply_text, video_path).
+    Both text and video are ready at the same time when this returns.
     """
     reply = agent.run(text)
 
+    video_id   = f"output_{uuid.uuid4().hex}.mp4"
+    video_path = f"/tmp/{video_id}"
     temp_voice = f"/tmp/voice_{uuid.uuid4().hex}.wav"
+
     voice.synthesize(reply, output_path=temp_voice)
-
-    temp_video = f"/tmp/output_{uuid.uuid4().hex}.mp4"
-    lipsync.generate(AVATAR_SILENT_VIDEO, temp_voice, temp_video)
-
+    lipsync.generate(AVATAR_SILENT_VIDEO, temp_voice, video_path)
     os.unlink(temp_voice)
-    return reply, temp_video
+
+    return reply, video_path
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -144,8 +157,8 @@ def session_start(
 def chat(request: ChatRequest):
     """
     Text-based conversation turn.
-    The LMS frontend sends the employee's typed or transcribed message.
-    Returns the avatar's text reply and a URL to stream the lip-sync video.
+    Runs the full pipeline synchronously (LLM → TTS → Wav2Lip) so that
+    text reply and lip-sync video arrive together in one response.
     """
     session = _require_session(request.session_id)
     agent = session["agent"]
@@ -154,7 +167,6 @@ def chat(request: ChatRequest):
 
     reply, video_path = _run_avatar_pipeline(agent, request.message)
 
-    # Expose the video via a one-time download endpoint
     video_id = os.path.basename(video_path)
     return ChatResponse(
         session_id=request.session_id,
@@ -165,19 +177,18 @@ def chat(request: ChatRequest):
 
 @app.post("/chat/audio", response_model=ChatResponse)
 async def chat_audio(
-    session_id: str,
-    audio: UploadFile = File(..., description="WAV audio from the employee's microphone"),
+    session_id: str = Form(...),
+    audio: UploadFile = File(..., description="Audio recording from the employee's microphone"),
 ):
     """
     Audio-based conversation turn.
-    The LMS frontend uploads a WAV recording; the Avatar transcribes it,
-    generates a reply, and returns the lip-sync video.
+    session_id must be sent as a form field alongside the audio file.
+    Transcribes audio then runs the full pipeline synchronously.
     """
     session = _require_session(session_id)
     agent = session["agent"]
 
-    # Save uploaded audio temporarily
-    temp_audio = f"/tmp/upload_{uuid.uuid4().hex}.wav"
+    temp_audio = f"/tmp/upload_{uuid.uuid4().hex}{os.path.splitext(audio.filename or '.webm')[1]}"
     with open(temp_audio, "wb") as f:
         f.write(await audio.read())
 
