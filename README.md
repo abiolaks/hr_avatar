@@ -135,11 +135,13 @@ The `recommend_courses` tool merges both sources before calling the recommendati
 | Method | Path | Caller | Purpose |
 |---|---|---|---|
 | `POST` | `/session/start` | LMS backend | Start session, pass employee profile |
+| `POST` | `/session/welcome` | LMS frontend | Generate personalised spoken welcome (TTS + lip-sync, no LLM) |
 | `POST` | `/chat` | LMS frontend | Text conversation turn |
 | `POST` | `/chat/audio` | LMS frontend | Audio upload — transcribed then processed |
 | `GET` | `/video/{id}` | LMS frontend | Stream the lip-sync video response |
 | `DELETE` | `/session/{id}` | LMS backend | End session on logout |
 | `GET` | `/health` | LMS / monitoring | Liveness check |
+| `POST` | `/admin/ingest` | Admin / CI | Trigger RAG ingestion from local folder and/or Azure Blob Storage |
 
 ---
 
@@ -303,12 +305,31 @@ Then open **http://localhost:3000** in your browser.
 
 | Feature | How to trigger |
 |---|---|
+| Personalised welcome | Automatic on sign-in — avatar speaks your name, role, and skills |
 | HR policy question | Type or ask "What is the annual leave policy?" |
 | Course recommendation | Click "Course Recs" quick button or ask naturally |
 | Knowledge assessment | Click "Assessment" quick button |
-| Voice input | Click the mic button, speak, click again to stop |
+| Voice input (VAD) | VAD activates automatically after the welcome — just speak |
+| Mute/unmute VAD | Click the mic button to toggle voice detection on/off |
 
-The avatar loops the silent face video while idle, shows "Thinking…" while processing, and plays the lip-synced response video when ready.
+The avatar loops the silent face video while idle, shows "Thinking…" while processing, and plays the lip-synced response video when ready. Text reply and video arrive simultaneously — neither appears without the other.
+
+#### Voice Activity Detection (VAD)
+
+The frontend uses browser-side VAD powered by the Web Audio API, mirroring the Python `vad/vad.py` behaviour:
+
+- **Auto-starts** after the welcome video finishes — no button press needed
+- **Automatically detects** when you start speaking (RMS amplitude threshold)
+- **Automatically stops** recording after ~700 ms of silence (matching Python `SILENCE_LIMIT`)
+- **Pauses** during backend processing (no accidental re-triggers)
+- **Mic button** = mute/unmute toggle, not a push-to-talk button
+
+Mic button states:
+| Colour | Meaning |
+|---|---|
+| Grey | VAD off (muted) |
+| Green pulse | Listening — waiting for speech |
+| Red pulse | Speech detected — recording |
 
 ### Mock services
 
@@ -395,15 +416,31 @@ ollama pull nomic-embed-text
 ### 7. Add HR documents and run
 
 ```bash
-# Place PDF/TXT policy files in hr_docs/
+# Place PDF/TXT/DOCX policy files in hr_docs/
 ollama serve          # separate terminal
 
-# Standalone microphone mode
+# Standalone microphone mode (ingests hr_docs/ on startup)
 python main.py
 
 # Or LMS API mode
 uvicorn web.app:app --host 0.0.0.0 --port 8000
 ```
+
+### 8. (Optional) Ingest documents from Azure Blob Storage
+
+```bash
+# Set Azure env vars
+export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=..."
+export AZURE_STORAGE_CONTAINER="hr-documents"
+
+# Trigger ingestion (local + Azure)
+curl -X POST http://localhost:8000/admin/ingest \
+  -H "Authorization: Bearer dev-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"local_path": "./hr_docs", "azure_container": "hr-documents"}'
+```
+
+Supported document formats: `.pdf`, `.txt`, `.docx`
 
 ---
 
@@ -464,7 +501,289 @@ Same as macOS steps 4–7 above. No code changes needed — XTTS and Whisper aut
 
 ---
 
-## Option C — Docker (Recommended for Ubuntu + NVIDIA)
+## Option C — Azure ML Compute Instance (Standard_NC8as_T4_v3)
+
+This is the recommended path for a shared demo or production pilot. The compute instance runs Ubuntu with CUDA pre-installed — no driver setup needed.
+
+### 1. Connect to the instance
+
+**Option A — Azure ML Studio terminal**
+In Azure ML Studio → Compute → your instance → click **Terminal**.
+
+**Option B — VS Code (recommended)**
+In Azure ML Studio → Compute → your instance → click **VS Code**. This opens a full remote session with integrated port forwarding.
+
+**Option C — SSH**
+```bash
+ssh azureuser@<your-instance-dns>.instances.azureml.ms
+```
+Get the SSH command from: Azure ML Studio → Compute → your instance → Connect → SSH instructions.
+
+---
+
+### 2. Verify GPU is available
+
+```bash
+nvidia-smi
+# Should show: Tesla T4, 16384MiB, CUDA Version 12.x
+```
+
+---
+
+### 3. Install system dependencies
+
+```bash
+sudo apt update && sudo apt install -y \
+    ffmpeg pkg-config portaudio19-dev \
+    git curl build-essential libsndfile1
+```
+
+---
+
+### 4. Clone the repository
+
+```bash
+cd /home/azureuser
+git clone https://github.com/abiolaks/hr_avatar.git
+cd hr_avatar
+```
+
+---
+
+### 5. Create Python environment
+
+Azure ML instances have Python 3.10 available. Check with:
+```bash
+python3.10 --version
+# If not found: sudo apt install python3.10 python3.10-venv
+```
+
+```bash
+python3.10 -m venv hr_venv
+source hr_venv/bin/activate
+```
+
+---
+
+### 6. Install PyTorch with CUDA (do this FIRST)
+
+CUDA 12.1 drivers are pre-installed on Azure ML GPU instances. Install the matching PyTorch build before `requirements.txt`:
+
+```bash
+pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 \
+    --index-url https://download.pytorch.org/whl/cu121
+```
+
+Verify GPU is visible to PyTorch:
+```bash
+python -c "import torch; print('CUDA:', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0))"
+# Expected: CUDA: True | Tesla T4
+```
+
+**Do not proceed if this returns False** — the pipeline will run on CPU and be slow.
+
+---
+
+### 7. Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+
+# TTS — bypass numpy pin
+pip install TTS==0.22.0 --no-deps
+pip install coqpit trainer "transformers==4.44.2" einops encodec unidecode \
+    inflect num2words pysbd anyascii spacy batch-face pypdf \
+    "pandas>=1.4,<2.0" bangla bnnumerizer bnunicodenormalizer \
+    hangul_romanize jamo jieba nltk pypinyin "gruut[de,es,fr]==2.2.3" \
+    umap-learn cython flask g2pkk "ollama>=0.3.0" "langchain-ollama==0.1.3" \
+    setuptools
+```
+
+---
+
+### 8. Clone Wav2Lip and download checkpoints
+
+```bash
+git clone https://github.com/justinjohn0306/Wav2Lip.git face/wav2lip
+
+# Wav2Lip GAN model (416 MB)
+curl -L "https://huggingface.co/Nekochu/Wav2Lip/resolve/main/wav2lip_gan.pth?download=true" \
+    -o wav2lip_gan.pth
+
+# Face detection model
+curl -L "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth" \
+    -o face/wav2lip/checkpoints/mobilenet.pth
+```
+
+---
+
+### 9. Install and start Ollama
+
+Azure ML instances do not have Ollama pre-installed.
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Start Ollama as a background service
+ollama serve &
+
+# Wait a few seconds, then pull models
+sleep 5
+ollama pull qwen3:4b
+ollama pull nomic-embed-text
+```
+
+Verify Ollama is using the GPU:
+```bash
+ollama run qwen3:4b "hello"
+# Watch nvidia-smi in another terminal — GPU utilisation should spike
+```
+
+---
+
+### 10. Upload assets
+
+The two asset files must be present — they are not in the repo (binary files).
+
+```bash
+mkdir -p assets
+```
+
+Copy from your local machine using `scp` or VS Code file explorer:
+- `assets/hr_avatar_silent.mp4` — looping silent face video (idle avatar)
+- `assets/voice_sample.wav` — voice cloning sample for XTTS (~10–30s of speech)
+
+```bash
+# From your LOCAL machine:
+scp assets/hr_avatar_silent.mp4  azureuser@<instance-dns>:/home/azureuser/hr_avatar/assets/
+scp assets/voice_sample.wav      azureuser@<instance-dns>:/home/azureuser/hr_avatar/assets/
+```
+
+---
+
+### 11. Add HR documents
+
+```bash
+# Copy your policy PDFs/TXTs into hr_docs/
+scp hr_docs/*.pdf azureuser@<instance-dns>:/home/azureuser/hr_avatar/hr_docs/
+
+# Or upload via VS Code file explorer
+```
+
+---
+
+### 12. Start all services
+
+Open three terminals (or use `tmux` / `screen` to keep sessions alive):
+
+**Terminal 1 — Ollama (if not already running)**
+```bash
+ollama serve
+```
+
+**Terminal 2 — Avatar API**
+```bash
+cd /home/azureuser/hr_avatar
+source hr_venv/bin/activate
+uvicorn web.app:app --host 0.0.0.0 --port 8000
+```
+
+**Terminal 3 — Mock LMS services**
+```bash
+cd /home/azureuser/hr_avatar
+source hr_venv/bin/activate
+python mock_services.py
+```
+
+**Terminal 4 — Frontend**
+```bash
+cd /home/azureuser/hr_avatar/frontend
+python3 -m http.server 3000
+```
+
+---
+
+### 13. Access the frontend from your local browser
+
+The compute instance is not publicly accessible on arbitrary ports. Use SSH port forwarding to tunnel the ports to your local machine.
+
+**If using VS Code Remote SSH:**
+In the Ports panel (bottom bar → Ports tab), add:
+- Port `8000` → forward to `localhost:8000`
+- Port `3000` → forward to `localhost:3000`
+
+VS Code does this automatically — just click **Add Port** and enter the number.
+
+**If using plain SSH:**
+```bash
+ssh -L 8000:localhost:8000 -L 3000:localhost:3000 \
+    azureuser@<instance-dns>.instances.azureml.ms
+```
+
+Then open **http://localhost:3000** in your browser. Requests to `localhost:8000` are automatically tunnelled to the instance.
+
+---
+
+### 14. Verify GPU is being used
+
+Run this in a separate terminal while the avatar is responding to a message:
+
+```bash
+watch -n 1 nvidia-smi
+```
+
+You should see:
+- GPU utilisation spike during XTTS synthesis and Wav2Lip
+- ~7–8GB of 16GB VRAM in use when all models are loaded
+- Overall latency ~10–18s vs 2–4 min on CPU
+
+---
+
+### 15. Keep services running when you disconnect
+
+Use `tmux` so sessions survive SSH disconnection:
+
+```bash
+# Install tmux (usually pre-installed on Azure ML)
+sudo apt install -y tmux
+
+# Start a named session
+tmux new -s hravatar
+
+# Inside tmux: start services, then detach with Ctrl+B then D
+# Reattach later:
+tmux attach -t hravatar
+```
+
+---
+
+### Estimated performance on NC8as_T4_v3
+
+| Stage | Time |
+|---|---|
+| Whisper (STT) | ~1–2s |
+| Ollama qwen3:4b | ~4–8s |
+| XTTS v2 | ~4–8s |
+| Wav2Lip | ~2–4s |
+| **Total end-to-end** | **~10–22s** |
+
+---
+
+### Cost control
+
+The instance charges only when **Running**. Stop it when not in use:
+
+```bash
+# From Azure ML Studio → Compute → Stop
+# Or via CLI:
+az ml compute stop --name <your-instance-name> --workspace-name <ws> --resource-group <rg>
+```
+
+At $0.94/hr an 8-hour demo day costs ~$7.50. Leaving it running overnight accidentally costs ~$7. Set an **idle shutdown** policy in Azure ML Studio → Compute → Edit → Idle shutdown.
+
+---
+
+## Option D — Docker (Recommended for Ubuntu + NVIDIA)
 
 Docker provides a consistent environment across machines without manual dependency management.
 
@@ -644,10 +963,12 @@ pytest tests/ -v
 
 | Variable | Default | Description |
 |---|---|---|
-| `LMS_SHARED_SECRET` | `dev-secret` | Secret the LMS backend uses to authenticate `/session/start` |
+| `LMS_SHARED_SECRET` | `dev-secret` | Secret the LMS backend uses to authenticate `/session/start` and `/admin/ingest` |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
 | `RECOMMENDATION_API_URL` | `http://localhost:8001/recommend` | LMS recommendation engine |
 | `ASSESSMENT_API_URL` | `http://localhost:8002/generate` | LMS assessment engine |
+| `AZURE_STORAGE_CONNECTION_STRING` | _(empty)_ | Azure Blob Storage connection string for RAG document ingestion |
+| `AZURE_STORAGE_CONTAINER` | `hr-documents` | Azure Blob Storage container name |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
 > Set `LMS_SHARED_SECRET` to a strong random value in production. Never commit it.

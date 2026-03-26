@@ -6,8 +6,20 @@ const SECRET = 'dev-secret';   // matches LMS_SHARED_SECRET in config.py
 // ── State ─────────────────────────────────────────────────────────────────────
 let sessionId     = null;
 let isProcessing  = false;
-let mediaRecorder = null;
-let audioChunks   = [];
+// ── VAD State ──────────────────────────────────────────────────────────────
+let vadActive      = false;   // VAD enabled (mic button toggles)
+let isSpeaking     = false;   // currently detected speech
+let silenceFrames  = 0;
+let speechFrames   = 0;
+let audioContext   = null;
+let analyser       = null;
+let micStream      = null;
+let vadRecorder    = null;
+let vadChunks      = [];
+
+const SPEECH_THRESHOLD = 0.018;   // RMS amplitude — analogous to Silero's 0.5 prob
+const SILENCE_LIMIT    = 42;      // frames @ ~60fps ≈ 700 ms (mirrors Python SILENCE_LIMIT)
+const SPEECH_CONFIRM   = 3;       // frames needed to confirm speech start
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const loginScreen      = document.getElementById('login-screen');
@@ -124,6 +136,16 @@ function setProcessing(val) {
   sendBtn.disabled  = val;
   msgInput.disabled = val;
   document.querySelectorAll('.quick-btn').forEach(b => b.disabled = val);
+
+  if (vadActive) {
+    if (val) {
+      // Hide VAD bar while backend is processing (thinking bubble takes over)
+      recordingBar.classList.add('hidden');
+    } else if (!isSpeaking) {
+      // Restore "listening" indicator once processing completes
+      updateVadUI('listening');
+    }
+  }
 }
 
 // ── Session Start ─────────────────────────────────────────────────────────────
@@ -214,6 +236,8 @@ async function fetchWelcome(sid) {
     setAvatar('idle');
   } finally {
     setProcessing(false);
+    // Auto-activate VAD after welcome so user can speak immediately
+    if (!vadActive) startVAD();
   }
 }
 
@@ -284,43 +308,151 @@ document.querySelectorAll('.quick-btn').forEach(btn => {
   });
 });
 
-// ── Voice Recording ───────────────────────────────────────────────────────────
-micBtn.addEventListener('click', async () => {
-  // Stop if already recording
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop();
-    return;
-  }
-
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioChunks = [];
-
-    // Prefer wav-compatible mime type
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus'
-      : 'audio/webm';
-
-    mediaRecorder = new MediaRecorder(stream, { mimeType });
-    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
-
-    mediaRecorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      micBtn.classList.remove('recording');
-      recordingBar.classList.add('hidden');
-
-      const blob = new Blob(audioChunks, { type: mimeType });
-      await sendAudio(blob);
-    };
-
-    mediaRecorder.start(100);
-    micBtn.classList.add('recording');
-    recordingBar.classList.remove('hidden');
-
-  } catch (err) {
-    showError('Microphone access denied. Please allow microphone access in your browser to use voice input.');
+// ── Voice / VAD ───────────────────────────────────────────────────────────────
+// Mic button toggles VAD on/off (mute/unmute). VAD auto-starts after welcome.
+micBtn.addEventListener('click', () => {
+  if (!sessionId) return;
+  if (vadActive) {
+    stopVAD();
+  } else {
+    startVAD();
   }
 });
+
+async function startVAD() {
+  if (vadActive) return;
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioContext = new AudioContext();
+    const source = audioContext.createMediaStreamSource(micStream);
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+
+    vadActive     = true;
+    isSpeaking    = false;
+    silenceFrames = 0;
+    speechFrames  = 0;
+
+    updateVadUI('listening');
+    monitorAudio();
+  } catch (err) {
+    showError('Microphone access denied. Please allow microphone access in your browser.');
+  }
+}
+
+function stopVAD() {
+  vadActive = false;
+  if (vadRecorder && vadRecorder.state !== 'inactive') vadRecorder.stop();
+  if (micStream)      { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (audioContext)   { audioContext.close(); audioContext = null; }
+  analyser   = null;
+  isSpeaking = false;
+  vadRecorder = null;
+  vadChunks   = [];
+  updateVadUI('off');
+}
+
+function getRMS(data) {
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) {
+    const v = (data[i] / 128.0) - 1.0;   // normalise byte → -1..+1
+    sum += v * v;
+  }
+  return Math.sqrt(sum / data.length);
+}
+
+function monitorAudio() {
+  if (!vadActive || !analyser) return;
+  const data = new Uint8Array(analyser.fftSize);
+
+  function loop() {
+    if (!vadActive || !analyser) return;
+    analyser.getByteTimeDomainData(data);
+    const rms = getRMS(data);
+
+    if (!isProcessing) {
+      if (!isSpeaking) {
+        // Waiting for speech to begin
+        if (rms > SPEECH_THRESHOLD) {
+          speechFrames++;
+          if (speechFrames >= SPEECH_CONFIRM) onSpeechStart();
+        } else {
+          speechFrames = 0;
+        }
+      } else {
+        // Currently speaking — watch for silence
+        if (rms < SPEECH_THRESHOLD) {
+          silenceFrames++;
+          if (silenceFrames >= SILENCE_LIMIT) onSpeechEnd();
+        } else {
+          silenceFrames = 0;
+        }
+      }
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame(loop);
+}
+
+function onSpeechStart() {
+  if (isSpeaking || !micStream) return;
+  isSpeaking    = true;
+  silenceFrames = 0;
+  speechFrames  = 0;
+  updateVadUI('speaking');
+
+  vadChunks = [];
+  const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+    ? 'audio/webm;codecs=opus' : 'audio/webm';
+
+  vadRecorder = new MediaRecorder(micStream, { mimeType });
+  vadRecorder.ondataavailable = (e) => { if (e.data.size > 0) vadChunks.push(e.data); };
+  vadRecorder.onstop = () => {
+    if (vadChunks.length > 0) {
+      const blob = new Blob(vadChunks, { type: mimeType });
+      sendAudio(blob);
+    }
+    vadChunks = [];
+  };
+  vadRecorder.start(100);
+}
+
+function onSpeechEnd() {
+  if (!isSpeaking) return;
+  isSpeaking    = false;
+  silenceFrames = 0;
+  speechFrames  = 0;
+  if (vadRecorder && vadRecorder.state === 'recording') vadRecorder.stop();
+  // UI reverts to 'listening' via setProcessing(false) once backend responds
+}
+
+function updateVadUI(state) {
+  // state: 'off' | 'listening' | 'speaking'
+  micBtn.classList.remove('vad-off', 'vad-listening', 'vad-speaking');
+  const statusText = document.getElementById('rec-status-text');
+
+  if (state === 'listening') {
+    micBtn.classList.add('vad-listening');
+    micBtn.title = 'VAD active — listening (click to mute)';
+    if (statusText) statusText.textContent = 'Listening… speak to send a voice message';
+    recordingBar.classList.add('listening');
+    recordingBar.classList.remove('hidden');
+  } else if (state === 'speaking') {
+    micBtn.classList.add('vad-speaking');
+    micBtn.title = 'Speech detected — recording';
+    if (statusText) statusText.textContent = 'Speech detected — recording…';
+    recordingBar.classList.remove('listening');
+    recordingBar.classList.remove('hidden');
+  } else {
+    micBtn.classList.add('vad-off');
+    micBtn.title = 'Click to activate voice detection';
+    recordingBar.classList.remove('listening');
+    recordingBar.classList.add('hidden');
+  }
+}
 
 async function sendAudio(blob) {
   setProcessing(true);
@@ -363,6 +495,7 @@ document.getElementById('end-btn').addEventListener('click', async () => {
   if (!sessionId) return;
   if (!confirm('End this session and return to the login screen?')) return;
 
+  if (vadActive) stopVAD();
   await fetch(`${API}/session/${sessionId}`, { method: 'DELETE' }).catch(() => {});
   sessionId = null;
 

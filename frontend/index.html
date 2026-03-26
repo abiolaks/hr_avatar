@@ -163,7 +163,7 @@
               rows="1"
             ></textarea>
             <div class="input-actions">
-              <button class="btn-mic" id="mic-btn" title="Voice message">
+              <button class="btn-mic vad-off" id="mic-btn" title="Click to activate voice detection">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
                   <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
@@ -180,8 +180,8 @@
             </div>
           </div>
           <div class="recording-bar hidden" id="recording-bar">
-            <span class="rec-dot"></span>
-            <span>Recording… click the mic again to stop</span>
+            <span class="rec-dot" id="rec-dot"></span>
+            <span id="rec-status-text">Listening… speak to send a voice message</span>
           </div>
         </div>
       </section>

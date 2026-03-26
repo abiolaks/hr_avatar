@@ -567,6 +567,162 @@ The tradeoff is a longer wait before anything appears (~2–4 min on CPU, ~10–
 
 ---
 
+## 28. Welcome Greeting — No Audio or Video Playing
+
+**Symptom:**
+On sign-in the text welcome message appeared in the chat but the avatar was silent and no video played.
+
+**Cause:**
+The welcome message was a static string hard-coded in the frontend JavaScript — no backend call was made. `playAvatarVideo()` was also using `.play()` directly without waiting for the video to buffer, causing the browser's autoplay policy to silently block it. By the time `/chat` was first called (~2–4 min later), the browser had closed the user-gesture window and blocked unmuted video autoplay.
+
+**Fix (backend):**
+Added `POST /session/welcome` to `web/app.py`. Builds a personalised greeting from the session profile, runs XTTS + Wav2Lip (no LLM call, so it's faster), and returns `reply` + `video_url` like a normal chat response.
+
+```python
+@app.post("/session/welcome", response_model=ChatResponse)
+def session_welcome(request: WelcomeRequest):
+    session = _require_session(request.session_id)
+    profile = session["profile"]
+    greeting = f"Welcome {name}! ..."
+    voice.synthesize(greeting, output_path=temp_voice)
+    lipsync.generate(AVATAR_SILENT_VIDEO, temp_voice, video_path)
+    return ChatResponse(session_id=..., reply=greeting, video_url=...)
+```
+
+**Fix (frontend — autoplay):**
+Changed `playAvatarVideo()` to listen for `oncanplay` before calling `.play()`, and added a click-to-play overlay for when the browser still blocks it:
+
+```javascript
+avatarVideo.oncanplay = () => {
+  avatarVideo.play().catch(() => {
+    playOverlay.classList.remove('hidden');  // user clicks to unblock
+  });
+};
+```
+
+**Fix (frontend — welcome call):**
+Added `fetchWelcome(sid)` called immediately after login. The welcome plays in the browser the same as any chat response.
+
+---
+
+## 29. Browser-Side Voice Activity Detection
+
+**Problem:**
+The mic button required the user to manually click to start and click again to stop recording. This was clunky compared to the Python `vad/vad.py` behaviour, which automatically detects speech start and stop from continuous audio monitoring.
+
+**Cause:**
+The original frontend used `MediaRecorder` with explicit start/stop triggered by button clicks, with no amplitude analysis.
+
+**Fix:**
+Replaced manual start/stop with a browser-side VAD using the Web Audio API, mirroring the Python Silero VAD logic:
+
+| Python (`vad.py`) | Browser (`app.js`) |
+|---|---|
+| Silero VAD model → speech probability | `AnalyserNode` → RMS amplitude |
+| `speech_threshold = 0.5` | `SPEECH_THRESHOLD = 0.018` |
+| `SILENCE_LIMIT = 20` frames (~640ms) | `SILENCE_LIMIT = 42` frames @ 60fps (~700ms) |
+| `PyAudio` + `torch.hub` | `AudioContext` + `requestAnimationFrame` |
+| Thread loop, puts to Queue | `requestAnimationFrame` loop, calls `sendAudio(blob)` |
+
+**Implementation:**
+- `startVAD()` — gets mic stream, creates `AudioContext` + `AnalyserNode`, starts `requestAnimationFrame` loop
+- `monitorAudio()` — computes RMS each frame; calls `onSpeechStart()` / `onSpeechEnd()` based on threshold + silence counter
+- `onSpeechStart()` — creates `MediaRecorder` on the existing stream, starts recording
+- `onSpeechEnd()` — stops recorder; blob passed to existing `sendAudio(blob)`
+- VAD auto-starts after the welcome video completes
+- During backend processing (`isProcessing = true`) the loop keeps running but `onSpeechStart()` is blocked — no accidental triggers
+- Mic button now toggles VAD on/off (mute/unmute) instead of start/stop recording
+
+**Mic button states:**
+- Grey (`vad-off`) — VAD off / muted
+- Green pulse (`vad-listening`) — listening for speech
+- Red pulse (`vad-speaking`) — speech detected, recording in progress
+
+---
+
+## 30. Azure Blob Storage — RAG Document Source
+
+**Requirement:**
+HR policy documents are stored in Azure Blob Storage. The RAG system needed to download and ingest them alongside local `hr_docs/` files.
+
+**Fix:**
+Extended `brain/rag.py` with two new methods:
+
+- `ingest_from_azure(container_name, connection_string)` — connects via SDK, lists blobs, downloads `.pdf`/`.txt`/`.docx` to a temp dir, calls existing `ingest_documents()`
+- `ingest_all(local_path, azure_container, azure_connection_string)` — convenience wrapper that runs both sources and returns total chunk count
+
+Added `POST /admin/ingest` endpoint to `web/app.py` (Bearer-auth protected) so ingestion can be triggered via HTTP after deploying new documents.
+
+Added `.docx` support to `ingest_documents()` using `Docx2txtLoader`.
+
+**Required env vars:**
+```bash
+export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;..."
+export AZURE_STORAGE_CONTAINER="hr-documents"
+```
+
+**Dependencies added to `requirements.txt`:** `azure-storage-blob`, `docx2txt`
+
+---
+
+## 31. Wav2Lip Reloads Model From Disk on Every Request (~5–7s Wasted)
+
+**Problem:**
+`face/face.py` ran Wav2Lip via `subprocess.run(["python", "inference.py", ...])`. Each call spawned a fresh Python process that:
+1. Imported all of Wav2Lip's dependencies (~2s)
+2. Loaded the 416MB GAN checkpoint from disk (~3–5s)
+3. Loaded the RetinaFace face detection model (~1s)
+4. Ran inference
+5. Exited — all models discarded
+
+On the next request this entire sequence repeated. ~5–7s was wasted on model loading alone, every single turn.
+
+**Fix:**
+Import `inference.py` as a Python module at server startup, call `do_load()` once to load both models into module globals, then call `main()` directly on each request with a patched `args` namespace:
+
+```python
+# __init__: load once
+import inference as _inf
+_inf.do_load(self.checkpoint)   # Wav2Lip GAN + RetinaFace → module globals
+self._inference = _inf
+
+# generate(): call directly, no subprocess
+self._inference.args = types.SimpleNamespace(wav2lip_batch_size=128, ...)
+self._inference.main()
+```
+
+`inference.py` already separates model loading (`do_load()`) from inference (`main()`), and uses a module-level `args` namespace — making it straightforward to patch without modifying the upstream file.
+
+**Saving:** ~5–7s per request eliminated. Combined with `beam_size=1` and GPU batch sizes, total pipeline drops from ~18–22s to ~8–12s on T4.
+
+---
+
+## 32. Running on Azure ML Compute Instance (Standard_NC8as_T4_v3)
+
+See the `## Option C — Azure ML Compute Instance` section in `README.md` for the full step-by-step runbook.
+
+**Key differences vs local Ubuntu setup:**
+- CUDA drivers and toolkit are pre-installed — no manual CUDA install needed
+- User is `azureuser`, home dir is `/home/azureuser/` (persists across restarts)
+- No display — frontend is accessed via SSH port forwarding or VS Code port forwarding, not `localhost` directly
+- Ollama must be installed manually (not pre-installed on Azure ML)
+- `frontend/app.js` API constant must point to the instance's forwarded port, not hardcoded `localhost:8000`
+
+**Port access pattern:**
+```
+Local browser → SSH tunnel → Azure ML instance:8000 (FastAPI)
+Local browser → SSH tunnel → Azure ML instance:3000 (Frontend)
+```
+
+**Verified GPU check before running:**
+```bash
+nvidia-smi                                          # should show T4
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# Expected: True  Tesla T4
+```
+
+---
+
 ## Final Working Install Sequence
 
 ### macOS (Apple Silicon — CPU)

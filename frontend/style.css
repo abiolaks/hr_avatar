@@ -649,7 +649,24 @@ html, body {
   border: 1.5px solid var(--border);
 }
 .btn-mic:hover { background: var(--border); color: var(--navy); }
-.btn-mic.recording {
+
+/* VAD states */
+.btn-mic.vad-off {
+  background: var(--bg);
+  color: var(--slate);
+  border-color: var(--border);
+}
+.btn-mic.vad-listening {
+  background: rgba(16,185,129,.1);
+  border-color: var(--green);
+  color: var(--green);
+  animation: vad-breathe 2s ease infinite;
+}
+@keyframes vad-breathe {
+  0%,100% { box-shadow: 0 0 0 0 rgba(16,185,129,.35); }
+  50%      { box-shadow: 0 0 0 6px rgba(16,185,129,0); }
+}
+.btn-mic.vad-speaking {
   background: #fef2f2;
   border-color: var(--red);
   color: var(--red);
@@ -659,6 +676,10 @@ html, body {
   0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,.3); }
   50%      { box-shadow: 0 0 0 6px rgba(239,68,68,0); }
 }
+
+/* Recording bar: green tint when only listening, red when speaking */
+.recording-bar.listening .rec-dot { background: var(--green); }
+.recording-bar.listening           { color: var(--green); }
 
 .btn-send {
   background: linear-gradient(135deg, var(--blue), #6366f1);
