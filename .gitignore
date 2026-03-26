@@ -213,11 +213,9 @@ __marimo__/
 hr_venv/
 chroma_db/
 logs/
-assets/
 wav2lip_gan.pth
 face/wav2lip/
 *.pth
-*.mp4
-*.wav
-*.jpg
-*.png
+
+# Generated / temp files (not source assets)
+face/wav2lip/temp/
