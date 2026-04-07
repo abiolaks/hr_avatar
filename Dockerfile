@@ -19,6 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10-venv \
     python3-pip \
     python3.10-dev \
+    # build-essential provides gcc/g++ needed by cython, pyaudio, gruut,
+    # and other packages that compile C extensions during pip install.
+    # The CUDA runtime base image does not include a compiler by default.
+    build-essential \
     git \
     curl \
     ffmpeg \

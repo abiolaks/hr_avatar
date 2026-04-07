@@ -12,8 +12,10 @@
 import asyncio
 import os
 import sys
+import time
 import uuid
 import concurrent.futures
+from contextlib import asynccontextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -27,7 +29,7 @@ import uvicorn
 
 from config import AVATAR_SILENT_VIDEO, ASSETS_DIR
 from brain.rag import RAGManager
-from brain.session import create_session, delete_session, get_session, active_session_count
+from brain.session import create_session, delete_session, get_session, active_session_count, prune_expired_sessions
 from transcriber.transcriber import Transcriber
 from voice.voice import VoiceSynthesizer
 from face.face import LipSyncGenerator
@@ -61,13 +63,71 @@ def _render_welcome_video() -> None:
 # max_workers=1 is intentional — these models share VRAM and cannot run in parallel.
 _lipsync_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-# job_id → {"status": "pending"|"ready"|"error", "video_path": str, "error": str}
+# job_id → {"status": "pending"|"ready"|"error", "video_path": str, "error": str,
+#            "created_at": float (time.time())}
 _video_jobs: dict = {}
+
+
+def _prune_video_jobs(max_age_seconds: int = 600) -> None:
+    """
+    Delete video job entries older than max_age_seconds (default 10 min).
+    Jobs that were never polled (client disconnected) would otherwise
+    accumulate in _video_jobs forever — this is the safety-net cleanup.
+    Entries that ARE polled to ready/error are deleted at poll time in
+    video_status(), so this mainly catches uncollected jobs.
+    """
+    cutoff = time.time() - max_age_seconds
+    stale = [jid for jid, j in _video_jobs.items() if j.get("created_at", 0) < cutoff]
+    for jid in stale:
+        _video_jobs.pop(jid, None)
+    if stale:
+        logger.info(f"Background prune: removed {len(stale)} stale video job(s)")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Replaces the deprecated @app.on_event("startup") pattern.
+    Code before `yield` runs on startup; code after runs on shutdown.
+
+    Startup tasks:
+      1. Pre-render the welcome video (if not already cached).
+      2. Launch a background task that prunes stale video jobs and
+         expired sessions every 5 minutes so neither dict grows unbounded.
+    """
+    # ── Startup ──────────────────────────────────────────────────────────────
+    if not os.path.exists(_WELCOME_VIDEO_PATH):
+        logger.info("Pre-rendering welcome video...")
+        # asyncio.get_running_loop() is the correct call inside an async context.
+        # asyncio.get_event_loop() was deprecated for this usage in Python 3.10+.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _render_welcome_video)
+    else:
+        logger.info("Cached welcome video found — skipping render.")
+
+    async def _prune_loop():
+        """Periodic cleanup: runs every 5 min for the server's lifetime."""
+        while True:
+            await asyncio.sleep(300)
+            prune_expired_sessions()
+            _prune_video_jobs()
+
+    prune_task = asyncio.create_task(_prune_loop())
+
+    yield  # ── server is running ────────────────────────────────────────────
+
+    # ── Shutdown ─────────────────────────────────────────────────────────────
+    prune_task.cancel()
+    try:
+        await prune_task
+    except asyncio.CancelledError:
+        pass
+
 
 app = FastAPI(
     title="HR Avatar API",
     description="LMS-integrated conversational HR assistant",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -78,16 +138,6 @@ app.add_middleware(
 )
 
 app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
-
-
-@app.on_event("startup")
-async def startup_tasks():
-    if not os.path.exists(_WELCOME_VIDEO_PATH):
-        logger.info("Pre-rendering welcome video...")
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _render_welcome_video)
-    else:
-        logger.info("Cached welcome video found — skipping render.")
 
 
 # Shared secret the LMS must send to create sessions.
@@ -168,7 +218,7 @@ def _start_lipsync_async(reply: str) -> str:
     job_id     = uuid.uuid4().hex
     video_path = f"/tmp/output_{uuid.uuid4().hex}.mp4"
     temp_voice = f"/tmp/voice_{uuid.uuid4().hex}.wav"
-    _video_jobs[job_id] = {"status": "pending"}
+    _video_jobs[job_id] = {"status": "pending", "created_at": time.time()}
     _lipsync_executor.submit(_lipsync_job, job_id, reply, temp_voice, video_path)
     return job_id
 
@@ -300,9 +350,12 @@ def video_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found.")
     if job["status"] == "ready":
         video_id = os.path.basename(job["video_path"])
+        _video_jobs.pop(job_id, None)  # delivered — remove from dict immediately
         return VideoJobStatus(ready=True, video_url=f"/video/{video_id}")
     if job["status"] == "error":
-        return VideoJobStatus(ready=False, error=job.get("error"))
+        err = job.get("error")
+        _video_jobs.pop(job_id, None)  # errored — remove from dict immediately
+        return VideoJobStatus(ready=False, error=err)
     return VideoJobStatus(ready=False)
 
 

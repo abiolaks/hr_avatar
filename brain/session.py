@@ -5,7 +5,7 @@
 # the avatar can load the right user profile and conversation history.
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from brain.agent import HRAgent
@@ -28,8 +28,8 @@ def create_session(profile: Dict[str, Any]) -> str:
     _store[session_id] = {
         "profile": profile,
         "agent": HRAgent(),
-        "created_at": datetime.utcnow(),
-        "last_active": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
+        "last_active": datetime.now(timezone.utc),
     }
     logger.info(f"Session created: {session_id} | user: {profile.get('user_id')}")
     return session_id
@@ -42,13 +42,13 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     # Expire stale sessions
-    cutoff = datetime.utcnow() - timedelta(minutes=SESSION_TTL_MINUTES)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=SESSION_TTL_MINUTES)
     if session["last_active"] < cutoff:
         delete_session(session_id)
         logger.info(f"Session expired: {session_id}")
         return None
 
-    session["last_active"] = datetime.utcnow()
+    session["last_active"] = datetime.now(timezone.utc)
     return session
 
 
@@ -60,3 +60,20 @@ def delete_session(session_id: str) -> None:
 
 def active_session_count() -> int:
     return len(_store)
+
+
+def prune_expired_sessions() -> int:
+    """
+    Remove all sessions that have been inactive longer than SESSION_TTL_MINUTES.
+    Called periodically by the web layer so abandoned sessions don't accumulate
+    in memory indefinitely (lazy expiry alone only cleans up on access).
+    Returns the number of sessions pruned.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=SESSION_TTL_MINUTES)
+    # Compare aware datetimes — all timestamps now use timezone.utc
+    expired = [sid for sid, s in _store.items() if s["last_active"] < cutoff]
+    for sid in expired:
+        _store.pop(sid, None)
+    if expired:
+        logger.info(f"Background prune: removed {len(expired)} expired session(s)")
+    return len(expired)

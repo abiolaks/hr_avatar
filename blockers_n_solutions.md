@@ -1122,3 +1122,129 @@ Added real subject-specific questions for all 24 courses in the recommendation c
 Total assessments: 26 (24 course-specific + 2 legacy IDs `python-101`, `ml-101` kept for backwards compatibility).
 
 **File changed:** `mock_services.py`
+
+---
+
+## 43. `_video_jobs` Dictionary — Unbounded Memory Growth (`web/app.py`)
+
+**Symptom:** Server memory usage grows steadily over time with no upper bound.
+
+**Cause:**
+Every `/chat` and `/chat/audio` call adds a job entry to `_video_jobs`. The dict was never cleaned up — jobs accumulated indefinitely regardless of whether the client ever polled them.
+
+**Fix — two-layer cleanup:**
+
+1. **Immediate cleanup at poll time** — `GET /video/status/{job_id}` now deletes the entry as soon as it returns `ready` or `error`. This covers the normal case (client always polls).
+
+2. **Periodic background sweep** — A `_prune_video_jobs()` function removes jobs older than 10 minutes. This covers the edge case where the client disconnects without polling. It runs every 5 minutes inside the lifespan background task (see fix #45).
+
+```python
+# web/app.py — created_at timestamp added to each job
+_video_jobs[job_id] = {"status": "pending", "created_at": time.time()}
+
+# Immediate cleanup in video_status()
+_video_jobs.pop(job_id, None)
+
+# Background sweep
+def _prune_video_jobs(max_age_seconds: int = 600) -> None:
+    cutoff = time.time() - max_age_seconds
+    stale = [jid for jid, j in _video_jobs.items() if j.get("created_at", 0) < cutoff]
+    for jid in stale:
+        _video_jobs.pop(jid, None)
+```
+
+**Files changed:** `web/app.py`
+
+---
+
+## 44. `datetime.utcnow()` Deprecated in Python 3.12+ (`brain/session.py`)
+
+**Symptom:** `DeprecationWarning: datetime.utcnow() is deprecated` on Python 3.12+. Will raise in a future Python version.
+
+**Cause:** `session.py` used `datetime.utcnow()` (returns a naive datetime with no timezone) for all session timestamps. `logger.py` already used the correct `datetime.now(timezone.utc)` — `session.py` did not.
+
+**Fix:** Import `timezone` and replace all three occurrences:
+```python
+# Before
+from datetime import datetime, timedelta
+datetime.utcnow()
+
+# After
+from datetime import datetime, timedelta, timezone
+datetime.now(timezone.utc)
+```
+
+**Files changed:** `brain/session.py`
+
+---
+
+## 45. `@app.on_event("startup")` and `asyncio.get_event_loop()` Deprecated (`web/app.py`)
+
+**Symptom:** FastAPI logs a deprecation warning for `@app.on_event`; Python 3.10+ logs a deprecation warning for `asyncio.get_event_loop()` called inside a running async context.
+
+**Cause:**
+- `@app.on_event("startup")` was deprecated in FastAPI in favour of the `lifespan` context manager pattern.
+- `asyncio.get_event_loop()` is deprecated for obtaining the *running* loop inside an async function; the correct call is `asyncio.get_running_loop()`.
+
+**Fix:** Migrate to `lifespan` and fix the loop call:
+```python
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    loop = asyncio.get_running_loop()   # correct inside async context
+    await loop.run_in_executor(None, _render_welcome_video)
+    prune_task = asyncio.create_task(_prune_loop())
+    yield
+    # shutdown
+    prune_task.cancel()
+    try:
+        await prune_task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(..., lifespan=lifespan)
+```
+
+The `lifespan` pattern also hosts the periodic `_prune_video_jobs` + `prune_expired_sessions` background task (see fixes #43 and #46).
+
+**Files changed:** `web/app.py`
+
+---
+
+## 46. Session Store — No Proactive Expiry (`brain/session.py`)
+
+**Symptom:** Abandoned sessions (employee closes tab without clicking logout) stay in the `_store` dict forever. On a multi-user deployment this is a slow memory leak.
+
+**Cause:** Expiry was lazy — a session was only removed when it was next accessed and found to be stale. Sessions that were never accessed again were never cleaned up.
+
+**Fix:** Added `prune_expired_sessions()` to `brain/session.py`. It scans `_store` and removes all sessions inactive longer than `SESSION_TTL_MINUTES`. It is called every 5 minutes by the lifespan background task in `web/app.py`.
+
+```python
+def prune_expired_sessions() -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=SESSION_TTL_MINUTES)
+    expired = [sid for sid, s in _store.items() if s["last_active"] < cutoff]
+    for sid in expired:
+        _store.pop(sid, None)
+    return len(expired)
+```
+
+**Files changed:** `brain/session.py`, `web/app.py`
+
+---
+
+## 47. Dockerfile — Missing C Compiler for pip Packages
+
+**Symptom:** Docker build fails or silently skips packages like `cython`, `pyaudio`, `gruut` that compile C extensions during `pip install`.
+
+**Cause:** The `nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04` base image does not include `gcc`/`g++`. The `build-essential` meta-package was missing from the `apt-get install` list.
+
+**Fix:** Add `build-essential` to the Dockerfile:
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ...
+```
+
+**Files changed:** `Dockerfile`
