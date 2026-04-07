@@ -19,14 +19,15 @@ AVATAR_IMAGE = os.path.join(ASSETS_DIR, "hr_avatar.jpg")
 AVATAR_SILENT_VIDEO = os.path.join(ASSETS_DIR, "hr_avatar_silent.mp4")
 
 # LLM
-OLLAMA_MODEL = "qwen3:4b"
+OLLAMA_MODEL = "granite4:3b"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBEDDING_MODEL = "nomic-embed-text"
 
 # API endpoints (set via environment or default)
 RECOMMENDATION_API_URL = os.getenv(
     "RECOMMENDATION_API_URL", "http://localhost:8001/recommend"
 )
-ASSESSMENT_API_URL = os.getenv("ASSESSMENT_API_URL", "http://localhost:8002/generate")
+ASSESSMENT_API_URL = os.getenv("ASSESSMENT_API_URL", "http://localhost:8001/generate")
 
 # LMS → Avatar shared secret  (set via env var in production)
 LMS_SHARED_SECRET = os.getenv("LMS_SHARED_SECRET", "dev-secret")

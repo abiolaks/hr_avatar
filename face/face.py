@@ -73,9 +73,9 @@ class LipSyncGenerator:
             static             = False,
             fps                = 25.0,
             pads               = pads,
-            wav2lip_batch_size = 128 if is_gpu else 32,
-            resize_factor      = 1,
-            out_height         = 480,
+            wav2lip_batch_size = 8,
+            resize_factor      = 2,    # downsample face input 2× before processing — faster face detection, no visible quality loss at screen sizes
+            out_height         = 360,  # reduced from 480; cuts frame processing time, still crisp on screen
             crop               = [0, -1, 0, -1],
             box                = [-1, -1, -1, -1],
             rotate             = False,
@@ -83,12 +83,17 @@ class LipSyncGenerator:
             img_size           = 96,
         )
 
+        if is_gpu:
+            torch.cuda.empty_cache()
+
         orig_dir = os.getcwd()
         os.chdir(WAV2LIP_DIR)    # inference.py resolves temp/ relative to cwd
         try:
             self._inference.main()
         finally:
             os.chdir(orig_dir)
+            if is_gpu:
+                torch.cuda.empty_cache()
 
         logger.info(f"Lip-sync video generated: {output_path}")
         return output_path

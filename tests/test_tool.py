@@ -141,8 +141,8 @@ class TestRecommendCourses:
         assert call_payload["preferred_duration"] == "Short"
 
     @patch("brain.tools.requests.post")
-    def test_no_duration_mention_defaults_to_short(self, mock_post):
-        """When no time was mentioned, preferred_duration defaults to 'Short'."""
+    def test_no_duration_mention_sends_none(self, mock_post):
+        """When no time was mentioned, preferred_duration is None (no filter applied)."""
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {"courses": [{"title": "ML 101", "description": ""}]}
@@ -155,7 +155,7 @@ class TestRecommendCourses:
             recommend_courses.invoke({"learning_goal": "learn ML"})  # no duration passed
 
         call_payload = mock_post.call_args[1]["json"]
-        assert call_payload["preferred_duration"] == "Short"
+        assert call_payload["preferred_duration"] is None
 
     @patch("brain.tools.requests.post")
     def test_preferred_category_forwarded_when_provided(self, mock_post):

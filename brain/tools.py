@@ -18,7 +18,7 @@ def retrieve_policy(query: str) -> str:
     Use this for any question about company policies, benefits, leave, etc.
     """
     logger.info(f"Tool: retrieve_policy called with query: {query[:100]}...")
-    docs = rag.retrieve(query, k=3)
+    docs = rag.retrieve(query, k=5)
     if not docs:
         return "No relevant policy documents found."
     context = "\n\n".join([doc.page_content for doc in docs])
@@ -91,7 +91,7 @@ def recommend_courses(
         # ── From the current conversation (extracted / inferred) ─────────
         "learning_goal": learning_goal,
         "preferred_difficulty": preferred_difficulty or profile.get("skill_level", "Beginner"),
-        "preferred_duration": preferred_duration or "Short",
+        "preferred_duration": preferred_duration or None,
         "preferred_category": preferred_category or "",
     }
 
@@ -107,8 +107,14 @@ def recommend_courses(
         if not courses:
             return "No courses found matching your criteria."
         result = "Here are some recommended courses:\n"
-        for i, course in enumerate(courses, 1):
-            result += f"{i}. {course['title']}: {course.get('description', '')}\n"
+        for course in courses:
+            url = course.get('url', '')
+            title = course['title']
+            desc  = course.get('description', '')
+            if url:
+                result += f"[{title}]({url}): {desc}\n"
+            else:
+                result += f"{title}: {desc}\n"
         logger.info(f"Recommendation API returned {len(courses)} courses")
         return result
     except Exception as e:

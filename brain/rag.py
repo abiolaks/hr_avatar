@@ -1,7 +1,7 @@
 # rag.py
 import os
 import tempfile
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
@@ -10,7 +10,7 @@ from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader,
 )
-from config import CHROMA_DIR, EMBEDDING_MODEL, AZURE_STORAGE_CONNECTION_STRING, AZURE_STORAGE_CONTAINER
+from config import CHROMA_DIR, AZURE_STORAGE_CONNECTION_STRING, AZURE_STORAGE_CONTAINER
 from logger import logger, log_performance
 
 
@@ -25,7 +25,8 @@ _LOADERS = {
 class RAGManager:
     def __init__(self, persist_dir=CHROMA_DIR):
         self.persist_dir = persist_dir
-        self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+        # FastEmbedEmbeddings runs in-process (no HTTP round-trip) — ~0.05s vs ~4.6s for OllamaEmbeddings
+        self.embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
         self.vectorstore = Chroma(
             persist_directory=str(persist_dir),
             embedding_function=self.embeddings,
@@ -38,11 +39,10 @@ class RAGManager:
         """Chunk a list of LangChain Documents and add them to the vectorstore."""
         if not documents:
             return 0
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=100)
         chunks = text_splitter.split_documents(documents)
         logger.info(f"Split into {len(chunks)} chunks")
         self.vectorstore.add_documents(chunks)
-        self.vectorstore.persist()
         logger.info(f"Ingested {len(chunks)} chunks into vectorstore")
         return len(chunks)
 

@@ -8,10 +8,10 @@ A real-time conversational AI HR assistant that listens to employee questions, g
 
 ### Standalone mode (microphone)
 ```
-Microphone → VAD → Whisper → LangGraph Agent → XTTS → Wav2Lip → Video
-                                    ↕
-                              ChromaDB (RAG)
-                         HR Policy Documents (PDF/TXT)
+Microphone → VAD → Whisper → HRAgent → XTTS → Wav2Lip → Video
+                                  ↕
+                            ChromaDB (RAG)
+                       HR Policy Documents (PDF/TXT)
 ```
 
 ### LMS-integrated mode (API)
@@ -36,12 +36,12 @@ LMS Frontend ──POST /chat──────────►  Agent.run()
 
 | Component | Technology |
 |---|---|
-| Voice Activity Detection | Silero VAD |
-| Speech-to-Text | faster-whisper (base model) |
-| AI Brain / Agent | LangGraph + ChatOllama (qwen3:4b) |
-| RAG / Policy Search | ChromaDB + OllamaEmbeddings (nomic-embed-text) |
-| Text-to-Speech | Coqui XTTS v2 (voice cloning) |
-| Lip Sync | Wav2Lip GAN |
+| Voice Activity Detection | Silero VAD (browser) / RMS threshold (Python standalone) |
+| Speech-to-Text | faster-whisper large-v3 (load-on-demand, unloads after each turn) |
+| AI Brain / Agent | Custom HRAgent + ChatOllama (granite4:3b) |
+| RAG / Policy Search | ChromaDB + FastEmbedEmbeddings (BAAI/bge-small-en-v1.5, in-process) |
+| Text-to-Speech | Coqui XTTS v2 (voice cloning from sample WAV) |
+| Lip Sync | Wav2Lip GAN + RetinaFace |
 | Web API | FastAPI + Uvicorn |
 | LMS Session Layer | In-memory session store + ContextVar profile injection |
 
@@ -61,12 +61,12 @@ hr_avatar/
 ├── blockers_n_solutions.md        # Setup issues and fixes log
 │
 ├── brain/
-│   ├── agent.py                   # LangGraph ReAct agent (profile-aware)
-│   ├── rag.py                     # ChromaDB RAG manager (PDF + TXT)
-│   ├── tools.py                   # LangChain tools (policy, recommend, assess)
-│   ├── session.py                 # In-memory session store
-│   ├── session_context.py         # ContextVar — injects LMS profile into tools
-│   └── state.py                   # Agent state
+│   ├── agent.py                   # Custom HRAgent — single-pass tool execution, hallucination guard
+│   ├── rag.py                     # ChromaDB RAG manager (PDF, TXT, DOCX — local + Azure)
+│   ├── tools.py                   # LangChain tools: retrieve_policy, recommend_courses, generate_assessment
+│   ├── session.py                 # In-memory session store (60-min TTL)
+│   ├── session_context.py         # ContextVar — injects LMS profile into tools per-request
+│   └── state.py                   # Agent state schema
 │
 ├── vad/vad.py                     # Microphone + speech segmentation
 ├── transcriber/transcriber.py     # faster-whisper wrapper
@@ -81,11 +81,12 @@ hr_avatar/
 │   ├── style.css                  # Professional styling
 │   └── app.js                     # Session, chat, audio, video logic
 │
-├── assets/                        # Avatar image, video, voice sample
-├── hr_docs/                       # HR policy documents (PDF or TXT)
+├── eval.py                        # End-to-end evaluation harness (tool routing + quality + latency)
+├── assets/                        # Avatar image, video, voice sample, pre-rendered welcome.mp4
+├── hr_docs/                       # HR policy documents (PDF, TXT, DOCX)
 └── tests/
     ├── test_rag.py                # RAG ingestion and retrieval
-    ├── test_tool.py               # Tool unit tests (mocked API calls)
+    ├── test_tool.py               # Tool unit tests (mocked API calls — no server needed)
     ├── test_session.py            # Session store + API endpoint tests
     └── test_brain.py              # Full agent conversation (requires Ollama)
 ```
@@ -409,8 +410,7 @@ curl -L "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Fi
 ### 6. Pull Ollama models
 
 ```bash
-ollama pull qwen3:4b
-ollama pull nomic-embed-text
+ollama pull granite4:3b
 ```
 
 ### 7. Add HR documents and run
@@ -629,13 +629,12 @@ ollama serve &
 
 # Wait a few seconds, then pull models
 sleep 5
-ollama pull qwen3:4b
-ollama pull nomic-embed-text
+ollama pull granite4:3b
 ```
 
 Verify Ollama is using the GPU:
 ```bash
-ollama run qwen3:4b "hello"
+ollama run granite4:3b "hello"
 # Watch nvidia-smi in another terminal — GPU utilisation should spike
 ```
 
@@ -761,8 +760,8 @@ tmux attach -t hravatar
 
 | Stage | Time |
 |---|---|
-| Whisper (STT) | ~1–2s |
-| Ollama qwen3:4b | ~4–8s |
+| Whisper large-v3 (STT) | ~1–2s |
+| Ollama granite4:3b | ~4–8s |
 | XTTS v2 | ~4–8s |
 | Wav2Lip | ~2–4s |
 | **Total end-to-end** | **~10–22s** |
@@ -938,9 +937,66 @@ volumes:
 
 > **Note:** After first `docker compose up`, pull Ollama models inside the container:
 > ```bash
-> docker compose exec ollama ollama pull qwen3:4b
-> docker compose exec ollama ollama pull nomic-embed-text
+> docker compose exec ollama ollama pull granite4:3b
+> docker compose exec ollama ollama pull granite4:3b
 > ```
+
+---
+
+## Agent Architecture
+
+The agent (`brain/agent.py`) uses a **single-pass custom implementation** instead of a LangGraph ReAct loop. This was necessary because ReAct's multi-step loop caused runaway tool-call chains with `granite4:3b` (up to 6 chained calls, ~57s latency).
+
+### How a turn works
+
+```
+User message
+     │
+     ▼
+llm_with_tools.invoke(messages)          ← single LLM call with tools bound
+     │
+     ├── response.tool_calls populated?
+     │       │
+     │       ├── retrieve_policy  → run tool → second LLM call (no tools) to summarise
+     │       ├── recommend_courses → run tool → _phrase_tool_result (no second LLM call)
+     │       └── generate_assessment → run tool → _phrase_tool_result
+     │
+     ├── response.content is a bare tool name? ("retrieve_policy")
+     │       └── leaked-tool-call fallback → run tool directly
+     │
+     └── direct LLM answer?
+             └── hallucination guard → if response looks like a course list, force recommend_courses
+```
+
+### Tool routing rules (enforced in system prompt + code)
+
+| Employee says… | Tool called | Second LLM pass? |
+|---|---|---|
+| Any HR policy / leave / benefits question | `retrieve_policy` | Yes — summarises multi-paragraph docs to 1–3 sentences |
+| Any learning / course / skills request | `recommend_courses` | No — structured list returned directly |
+| "I finished [course], test me" | `generate_assessment` | No — question list returned directly |
+
+### Hallucination guard
+
+If the model attempts to answer a course recommendation from memory (response contains "here are some courses", "I recommend", etc.) without calling the tool, the guard detects the pattern and forces a `recommend_courses` call. This prevents the avatar from inventing course names.
+
+---
+
+## Evaluation
+
+`eval.py` runs a fixed set of 15 test cases against the live system and reports:
+
+```bash
+source hr_venv/bin/activate
+python mock_services.py   # Terminal 1
+python eval.py            # Terminal 2 (Ollama must be running)
+```
+
+Metrics reported:
+- **Tool routing accuracy** — was the correct tool called for each input?
+- **Response quality** — does the response contain expected keywords?
+- **Hallucination guard fires** — how many times did the safety net intercept?
+- **Latency** — per-case, average, and p95
 
 ---
 
@@ -952,9 +1008,9 @@ pytest tests/ -v
 
 | Test file | What it tests | Requires |
 |---|---|---|
-| `test_rag.py` | RAG document ingestion and retrieval | Ollama running |
-| `test_tool.py` | `recommend_courses` and `generate_assessment` tools | Mocked — no server needed |
-| `test_session.py` | Session store, `/session/start`, `/chat` endpoints | Mocked — no server needed |
+| `test_rag.py` | RAG document ingestion and retrieval | None (FastEmbed is in-process) |
+| `test_tool.py` | `recommend_courses` and `generate_assessment` tools | None (API calls mocked) |
+| `test_session.py` | Session store, `/session/start`, `/chat` endpoints | None (mocked) |
 | `test_brain.py` | HRAgent full conversation | Ollama running |
 
 ---
@@ -966,7 +1022,7 @@ pytest tests/ -v
 | `LMS_SHARED_SECRET` | `dev-secret` | Secret the LMS backend uses to authenticate `/session/start` and `/admin/ingest` |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
 | `RECOMMENDATION_API_URL` | `http://localhost:8001/recommend` | LMS recommendation engine |
-| `ASSESSMENT_API_URL` | `http://localhost:8002/generate` | LMS assessment engine |
+| `ASSESSMENT_API_URL` | `http://localhost:8001/generate` | LMS assessment engine |
 | `AZURE_STORAGE_CONNECTION_STRING` | _(empty)_ | Azure Blob Storage connection string for RAG document ingestion |
 | `AZURE_STORAGE_CONTAINER` | `hr-documents` | Azure Blob Storage container name |
 | `LOG_LEVEL` | `INFO` | Logging level |
@@ -990,7 +1046,40 @@ pytest tests/ -v
 - *"Something advanced in data science, I can dedicate about 10 hours a week"* — infers `Medium`, difficulty `Advanced`
 
 ### Assessments
-- *"I just finished the Python basics course"* — agent asks for course ID if needed, generates quiz
+- *"I just finished the Python Basics course"* — agent extracts the course name as the ID
+- *"I finished CS50P, test me"* — maps to `cs50p`, serves real Python questions
+- *"I completed the Machine Learning Specialization"* — maps to `machine-learning-specialization`
+
+The course name the employee gives is lowercased and spaces replaced with hyphens to look up the assessment. All 24 courses in the catalog have real questions. Any unrecognised course falls back to a 3-question self-reflection set.
+
+**Assessment course IDs** (say the course name naturally — the system maps it automatically):
+
+| Category | Course | ID |
+|---|---|---|
+| Python | CS50P: Intro to Programming with Python | `cs50p` |
+| Python | Kaggle Python | `kaggle-python` |
+| Python | Automate the Boring Stuff with Python | `automate-the-boring-stuff` |
+| Python | Python for Everybody Specialization | `python-for-everybody` |
+| Python | Python Intermediate: OOP | `python-oop` |
+| Machine Learning | Google ML Crash Course | `google-ml-crash-course` |
+| Machine Learning | Kaggle: Intro to Machine Learning | `kaggle-intro-to-machine-learning` |
+| Machine Learning | Microsoft ML for Beginners | `microsoft-ml-for-beginners` |
+| Machine Learning | Machine Learning Specialization (Andrew Ng) | `machine-learning-specialization` |
+| Machine Learning | Kaggle: Intermediate Machine Learning | `kaggle-intermediate-machine-learning` |
+| Machine Learning | fast.ai: Practical Machine Learning | `fastai-practical-machine-learning` |
+| Machine Learning | Stanford CS229 | `stanford-cs229` |
+| Deep Learning | Deep Learning Specialization (Andrew Ng) | `deep-learning-specialization` |
+| Deep Learning | MIT 6.S191: Intro to Deep Learning | `mit-intro-deep-learning` |
+| Deep Learning | fast.ai: Deep Learning from the Foundations | `fastai-deep-learning-foundations` |
+| AI Agents | Introduction to AI Agents | `introduction-to-ai-agents` |
+| AI Agents | AI Agents in LangGraph | `ai-agents-in-langgraph` |
+| AI Agents | LangChain for LLM Application Development | `langchain-for-llm-application-development` |
+| AI Agents | Functions, Tools and Agents with LangChain | `functions-tools-and-agents-with-langchain` |
+| AI Agents | Building Agentic RAG with LlamaIndex | `building-agentic-rag-with-llamaindex` |
+| Data Science | Kaggle: Pandas | `kaggle-pandas` |
+| Data Science | Kaggle: Data Visualisation | `kaggle-data-visualisation` |
+| Data Science | Data Analysis with Python (freeCodeCamp) | `data-analysis-with-python` |
+| Data Science | Kaggle: Feature Engineering | `kaggle-feature-engineering` |
 
 ---
 
@@ -1002,4 +1091,4 @@ pytest tests/ -v
 - **Video storage**: Lip-sync videos stored in `/tmp` — lost on restart. Use S3 or a persistent volume for production.
 - **Recommendation/Assessment APIs**: `mock_services.py` is used in dev. The real LMS services must be built and pointed to via environment variables.
 - **Microphone in Docker**: Requires `/dev/snd` device passthrough.
-- **LLM tool reliability**: `qwen3:4b` performs best with clear, direct questions.
+- **LLM tool reliability**: `granite4:3b` performs best with clear, direct questions. Very short or ambiguous inputs may not reliably trigger the correct tool.

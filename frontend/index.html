@@ -99,7 +99,7 @@
             <video
               id="avatar-idle"
               src="http://localhost:8000/assets/hr_avatar_silent.mp4"
-              autoplay loop muted playsinline
+              autoplay loop muted playsinline preload="auto"
             ></video>
             <!-- Speaking: generated lip-sync video (shown only when response arrives) -->
             <video id="avatar-video" playsinline></video>
@@ -182,6 +182,7 @@
           <div class="recording-bar hidden" id="recording-bar">
             <span class="rec-dot" id="rec-dot"></span>
             <span id="rec-status-text">Listening… speak to send a voice message</span>
+            <div class="mic-level-wrap"><div class="mic-level-bar" id="mic-level-bar"></div></div>
           </div>
         </div>
       </section>
@@ -189,6 +190,8 @@
     </main>
   </div>
 
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/bundle.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -822,6 +822,114 @@ ollama pull nomic-embed-text
 
 ---
 
+---
+
+## 33. Wav2Lip — CUDA Out of Memory (Competing Ollama Process)
+
+**Error:**
+```
+CUDA out of memory. Tried to allocate 1.53 GiB. GPU 0 has a total capacity of 11.50 GiB
+of which 1.24 GiB is free. Process 8240 has 4.57 GiB memory in use.
+```
+
+**Cause:**
+Ollama keeps the LLM loaded in GPU VRAM for 5 minutes after each response (its default `keep_alive`). When Wav2Lip runs immediately after the LLM step, both models compete for GPU memory. With an 11.5 GiB GPU: ~5.7 GiB (our process) + 4.57 GiB (Ollama) = ~10.3 GiB in use, leaving only ~1.2 GiB free — not enough for Wav2Lip's peak allocation.
+
+**Fix — two changes:**
+
+1. **Set `keep_alive=0` in `ChatOllama`** (`brain/agent.py`) — tells Ollama to unload the model from GPU immediately after generating a response, freeing the 4.57 GiB before TTS/Wav2Lip run:
+```python
+self.llm = ChatOllama(
+    model=OLLAMA_MODEL,
+    ...
+    keep_alive=0,   # unload from GPU immediately — frees VRAM for Wav2Lip
+)
+```
+
+2. **Reduce `wav2lip_batch_size` from 32 to 8** (`face/face.py`) — lowers peak VRAM during the inference forward pass as a safety margin:
+```python
+wav2lip_batch_size = 8,
+```
+
+3. **Add `torch.cuda.empty_cache()`** before and after inference in `face/face.py` — releases fragmented allocations between requests.
+
+**Trade-off:** Ollama reloads the model on each request (~2–3s), but this is absorbed into the TTS synthesis time and invisible to the user.
+
+---
+
+## 34. Mistral Tool-Call JSON Leaking at End of Response
+
+**Symptom:**
+Avatar replied with visible raw JSON at the end of its message:
+```
+To test your knowledge, let's generate an assessment for the Python Basics course.
+[{"name":"generate_assessment","arguments":{"course_id":"Python Basics"}}]
+```
+
+**Cause:**
+Mistral (via Ollama) sometimes emits tool invocations as plain text content rather than structured tool calls. The existing regex in `brain/agent.py` only stripped the `[TOOL_CALLS]` prefix at the start of the message, not trailing JSON arrays at the end.
+
+**Fix:**
+Added a second regex to strip trailing tool-call JSON arrays:
+```python
+# Before: only stripped leading [TOOL_CALLS] token
+ai_message = re.sub(r'^\[TOOL_CALLS\]\s*(\[.*?\])?\s*', '', ai_message, flags=re.DOTALL)
+
+# After: also strips trailing [{"name":...}] arrays
+ai_message = re.sub(r'^\[TOOL_CALLS\]\s*(\[.*?\])?\s*', '', ai_message, flags=re.DOTALL)
+ai_message = re.sub(r'\s*\[\s*\{\s*"name"\s*:.*?\}\s*\]\s*$', '', ai_message, flags=re.DOTALL)
+```
+
+---
+
+## 35. Assessment API — Wrong Port (8002 vs 8001)
+
+**Symptom:**
+Assessment tool not working — `generate_assessment` tool calls failed silently or the agent emitted raw tool-call JSON.
+
+**Cause:**
+`ASSESSMENT_API_URL` in `config.py` was hardcoded to `http://localhost:8002/generate`. But `mock_services.py` serves both `/recommend` and `/generate` on port **8001**. Port 8002 was never started.
+
+**Fix:**
+```python
+# config.py — before
+ASSESSMENT_API_URL = os.getenv("ASSESSMENT_API_URL", "http://localhost:8002/generate")
+
+# config.py — after
+ASSESSMENT_API_URL = os.getenv("ASSESSMENT_API_URL", "http://localhost:8001/generate")
+```
+
+---
+
+## 36. Lip-Sync and TTS Cut Off Mid-Sentence
+
+**Symptom:**
+Avatar would speak and display a full answer but stop before the last sentence — e.g. a leave policy answer ended at "20 working days." and cut "If you have any questions about other." entirely.
+
+**Cause:**
+`num_predict=150` in `ChatOllama` was too low for multi-point policy answers. The model hit the token limit mid-sentence. The truncated text was passed directly to XTTS and Wav2Lip, which faithfully synthesised the incomplete response.
+
+**Fix — two changes:**
+
+1. **Increase `num_predict` from 150 to 300** (`brain/agent.py`):
+```python
+num_predict=300,  # enough for policy summaries
+```
+
+2. **Add `_trim_to_last_sentence()` safety net** (`brain/agent.py`) — if the model still hits the limit mid-sentence, the dangling fragment is dropped before TTS ever sees it:
+```python
+def _trim_to_last_sentence(text: str) -> str:
+    if re.search(r'[.!?]["\']?\s*$', text):
+        return text
+    match = re.search(r'^(.*[.!?]["\']?)\s+\S', text, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text
+```
+Called at the end of the response cleanup block in `HRAgent.run()`.
+
+---
+
 ### Running after setup (both platforms)
 
 ```bash
@@ -840,3 +948,177 @@ python mock_services.py
 cd frontend && python -m http.server 3000
 # Open http://localhost:3000
 ```
+
+---
+
+## 37. Agent Returns "retrieve_policy" as Text Instead of Policy Content
+
+**Symptom:**
+When an employee asked a policy question (e.g. "What is the annual leave policy?"), the avatar spoke and displayed the literal text `retrieve_policy` instead of the actual policy answer. Logs showed:
+```
+INFO - Agent response: retrieve_policy...
+```
+No `"Tool: retrieve_policy called"` log entry appeared between the user input and the response.
+
+**Cause:**
+The original `brain/agent.py` used `langgraph.prebuilt.create_react_agent` to drive the conversation loop. With `granite4:3b`, the ReAct loop did not reliably execute the tool call — it returned the tool name as plain text content instead of a structured `tool_calls` object, and the loop exited without running the tool. The raw tool name was then passed through to TTS and Wav2Lip unchanged.
+
+**Fix:**
+Replaced `create_react_agent` with a custom `HRAgent` class that handles tool calls explicitly in a single pass:
+
+1. **Structured tool call path** (`response.tool_calls` populated): model returns a proper function-call object → tool is executed directly.
+2. **Leaked-tool-call fallback** (`response.content` is a bare tool name or JSON): detected by `_try_execute_leaked_tool_call()` → tool is executed using the user's original message as the query argument.
+3. **Policy summarisation**: `retrieve_policy` results are multi-paragraph, so a second LLM call (with no tools bound) summarises them to 1–3 sentences for TTS delivery.
+
+This eliminated the runaway-loop problem (granite4 was chaining 6 tool calls in the old ReAct setup, ~57s latency) and guarantees the tool always executes.
+
+**Files changed:** `brain/agent.py` (full rewrite)
+
+---
+
+## 38. Assessment Output Truncated — Last Question Missing Options
+
+**Symptom:**
+When the avatar generated an assessment, the last question was spoken and displayed without its answer options:
+```
+Would you recommend this course to a colleague?
+```
+The options (Definitely / Probably / Not sure / No) were silently dropped.
+
+**Cause:**
+`_trim_to_last_sentence()` was applied unconditionally to every agent response — including direct tool outputs. The function searches for the last `[.!?]` followed by a non-whitespace character and trims everything after it. For assessment text, the last question ends with `?` and is followed by answer options that have no terminal punctuation. The regex matched the `?` at the end of the question and trimmed the trailing options as a "dangling fragment".
+
+**Root pattern:**
+```
+Would you recommend this course to a colleague?   ← ? found here
+Definitely                                         ← trimmed (no punctuation before EOF)
+Probably
+Not sure
+No
+```
+
+**Fix:**
+Added a `_needs_sentence_trim` flag (default `True`) that is set to `False` for all paths where the response is complete tool output rather than LLM-generated prose:
+
+```python
+_needs_sentence_trim = True   # LLM prose may be cut off mid-sentence
+
+# After _phrase_tool_result() for assessments / recommendations:
+_needs_sentence_trim = False  # tool output is already complete
+
+# Only trim LLM-generated content
+if _needs_sentence_trim:
+    ai_message = _trim_to_last_sentence(ai_message)
+```
+
+`_trim_to_last_sentence` still runs for:
+- Policy summaries (LLM-generated, may be cut off by `num_predict`)
+- Direct LLM answers with no tool call
+
+**File changed:** `brain/agent.py`
+
+---
+
+## 39. `vectorstore.persist()` Deprecation Warning on Every Ingestion
+
+**Symptom:**
+Every call to `RAGManager._add_documents()` (triggered by `ingest_documents`, `ingest_from_azure`, or `ingest_all`) printed a deprecation warning to stderr:
+```
+LangChainDeprecationWarning: Since Chroma 0.4.x the manual persistence method is
+no longer supported as docs are automatically persisted.
+```
+
+**Cause:**
+`brain/rag.py` called `self.vectorstore.persist()` after adding documents. In `chromadb >= 0.4.0` (the version in `requirements.txt`), persistence is automatic — every `add_documents` call writes to disk immediately. The explicit `persist()` call is a no-op but emits a `LangChainDeprecationWarning` on every invocation.
+
+**Fix:**
+Removed the `self.vectorstore.persist()` call. Documents are persisted automatically by chromadb 0.4.x with no action required:
+
+```python
+# Before
+self.vectorstore.add_documents(chunks)
+self.vectorstore.persist()   # ← removed
+logger.info(f"Ingested {len(chunks)} chunks into vectorstore")
+
+# After
+self.vectorstore.add_documents(chunks)
+logger.info(f"Ingested {len(chunks)} chunks into vectorstore")
+```
+
+**File changed:** `brain/rag.py`
+
+---
+
+## 40. OllamaEmbeddings Replaced with FastEmbedEmbeddings
+
+**Symptom / Motivation:**
+RAG retrieval added ~4.6 seconds of latency per turn because `OllamaEmbeddings` made an HTTP round-trip to the Ollama server for every query. On a policy question this meant:
+
+```
+User message → embed query (4.6s) → ChromaDB search → LLM summarise
+```
+
+Additionally, if Ollama was not running or the `nomic-embed-text` model was not pulled, RAG would silently fail with a connection error.
+
+**Cause / Background:**
+The original `brain/rag.py` used:
+```python
+from langchain_community.embeddings import OllamaEmbeddings
+self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)  # nomic-embed-text
+```
+This required Ollama to be running and the embedding model pre-pulled.
+
+**Fix:**
+Switched to `FastEmbedEmbeddings`, which runs the embedding model in-process (no HTTP, no Ollama dependency):
+```python
+from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+self.embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+```
+
+Results:
+- Embedding latency: **4.6s → ~0.05s** per query
+- No Ollama dependency for RAG — embeddings work even if Ollama is down
+- `nomic-embed-text` no longer needs to be pulled
+
+**Important:** The vectorstore was re-ingested after this change. `BAAI/bge-small-en-v1.5` produces 384-dimensional vectors vs. 768 from `nomic-embed-text`. Mixing embedding models in one ChromaDB collection causes incorrect similarity scores — if switching models on an existing vectorstore, always delete `chroma_db/` and re-ingest:
+
+```bash
+rm -rf chroma_db/
+curl -X POST http://localhost:8000/admin/ingest \
+  -H "Authorization: Bearer dev-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"local_path": "./hr_docs"}'
+```
+
+**Files changed:** `brain/rag.py`, `config.py` (removed `EMBEDDING_MODEL` import from rag.py)
+
+---
+
+## 41. Assessment Catalog — Generic Fallback for All Courses
+
+**Symptom / Motivation:**
+Any course the employee mentioned that wasn't `python-101` or `ml-101` returned the same generic 3-question self-reflection set:
+```
+What was the main concept covered in '[course]'?
+How confident are you in applying what you learned?
+Would you recommend this course to a colleague?
+```
+This was unhelpful for knowledge testing and did not reflect the actual course content.
+
+**Cause:**
+`mock_services.py` only had two entries in `ASSESSMENTS` — `python-101` and `ml-101`.
+
+**Fix:**
+Added real subject-specific questions for all 24 courses in the recommendation catalog. Each entry has 3 multiple-choice questions with 4 options, keyed by the course name lowercased with spaces replaced by hyphens (matching how the agent extracts and passes the `course_id`):
+
+| Category | New IDs added |
+|---|---|
+| Python | `cs50p`, `kaggle-python`, `automate-the-boring-stuff`, `python-for-everybody`, `python-oop` |
+| Machine Learning | `google-ml-crash-course`, `kaggle-intro-to-machine-learning`, `microsoft-ml-for-beginners`, `machine-learning-specialization`, `kaggle-intermediate-machine-learning`, `fastai-practical-machine-learning`, `stanford-cs229` |
+| Deep Learning | `deep-learning-specialization`, `mit-intro-deep-learning`, `fastai-deep-learning-foundations` |
+| AI Agents | `introduction-to-ai-agents`, `ai-agents-in-langgraph`, `langchain-for-llm-application-development`, `functions-tools-and-agents-with-langchain`, `building-agentic-rag-with-llamaindex` |
+| Data Science | `kaggle-pandas`, `kaggle-data-visualisation`, `data-analysis-with-python`, `kaggle-feature-engineering` |
+
+Total assessments: 26 (24 course-specific + 2 legacy IDs `python-101`, `ml-101` kept for backwards compatibility).
+
+**File changed:** `mock_services.py`

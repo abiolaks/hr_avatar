@@ -211,11 +211,17 @@ __marimo__/
 
 # Project-specific
 hr_venv/
+.venv/
 chroma_db/
 logs/
 wav2lip_gan.pth
 face/wav2lip/
+face/wav2lip~/
 *.pth
 
 # Generated / temp files (not source assets)
 face/wav2lip/temp/
+
+# Scratch / error files
+.clear
+error_fie

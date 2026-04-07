@@ -1,0 +1,72 @@
+# =============================================================================
+# HR Avatar — Docker Compose
+#
+# Services:
+#   ollama  — LLM runtime (pulls granite4:3b on first start)
+#   avatar  — HR Avatar API (FastAPI on port 8000)
+#
+# Quick start:
+#   1. cp .env.example .env          # add your secrets
+#   2. Place wav2lip_gan.pth in the project root (see README for download)
+#   3. Place assets/ files (hr_avatar.jpg, hr_voice_sample.wav, hr_avatar_silent.mp4)
+#   4. docker compose up --build
+# =============================================================================
+
+services:
+
+  # ── Ollama LLM runtime ──────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Pull the model on first start, then keep the service running
+    entrypoint: >
+      sh -c "ollama serve &
+             sleep 5 &&
+             ollama pull granite4:3b &&
+             wait"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── HR Avatar API ───────────────────────────────────────────────────────────
+  avatar:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override OLLAMA_BASE_URL so the container reaches the ollama service
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      # Large binaries — mount from host, not baked into image
+      - ./wav2lip_gan.pth:/app/wav2lip_gan.pth:ro
+      # Avatar assets (image, voice sample, silent video)
+      - ./assets:/app/assets
+      # HR policy documents for RAG ingestion
+      - ./hr_docs:/app/hr_docs
+      # Persistent ChromaDB vector store
+      - ./chroma_db:/app/chroma_db
+      # Logs
+      - ./logs:/app/logs
+    depends_on:
+      - ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  ollama_data:
